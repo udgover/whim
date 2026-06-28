@@ -1,0 +1,29 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - staticcheck
+    - revive
+    - gosec
+    - govet
+  settings:
+    revive:
+      rules:
+        - name: exported
+        - name: var-naming
+    gosec:
+      excludes:
+        - G304 # file inclusion via variable — acceptable in CLI tools
+  exclusions:
+    rules:
+      # Test files: relax error-checking and security lints for fixtures.
+      - path: '_test\.go'
+        linters:
+          - gosec
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
