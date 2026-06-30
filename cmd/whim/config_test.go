@@ -56,6 +56,69 @@ func TestLoadConfig_CorruptJSON_ReturnsError(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestLoadConfig_OldFormatImageArnOnly(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("WHIM_CONFIG_DIR", dir)
+	path := filepath.Join(dir, "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"image_arn":"arn:aws:lambda:us-east-1:123:microvm-image:whim-default"}`), 0600))
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	assert.Equal(t, "arn:aws:lambda:us-east-1:123:microvm-image:whim-default", cfg.ImageARN)
+	assert.Empty(t, cfg.Images, "absent images map loads as empty")
+}
+
+func TestSaveConfig_PersistsBothImageArnAndImages(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("WHIM_CONFIG_DIR", dir)
+
+	cfg := &Config{ImageARN: "arn:default"}
+	cfg.SetImage("api", "arn:api")
+	require.NoError(t, SaveConfig(cfg))
+
+	loaded, err := LoadConfig()
+	require.NoError(t, err)
+	assert.Equal(t, "arn:default", loaded.ImageARN, "top-level image_arn preserved")
+	got, ok := loaded.Image("api")
+	assert.True(t, ok)
+	assert.Equal(t, "arn:api", got)
+}
+
+func TestConfigCustomImage_SetGet(t *testing.T) {
+	var cfg Config // zero value: nil Images map
+	_, ok := cfg.Image("missing")
+	assert.False(t, ok, "unknown image name reports not found")
+
+	cfg.SetImage("api", "arn:api")
+	cfg.SetImage("web", "arn:web")
+	got, ok := cfg.Image("api")
+	assert.True(t, ok)
+	assert.Equal(t, "arn:api", got)
+
+	// Overwrite is allowed (name is the cache key).
+	cfg.SetImage("api", "arn:api-v2")
+	got, _ = cfg.Image("api")
+	assert.Equal(t, "arn:api-v2", got)
+}
+
+func TestCacheDefaultImage_PreservesCustomImages(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("WHIM_CONFIG_DIR", dir)
+	cfg := &Config{ImageARN: "arn:old-default"}
+	cfg.SetImage("api", "arn:api")
+	require.NoError(t, SaveConfig(cfg))
+
+	// Re-caching the default (as `whim init` does) must not drop custom images.
+	require.NoError(t, cacheDefaultImage("arn:new-default"))
+
+	loaded, err := LoadConfig()
+	require.NoError(t, err)
+	assert.Equal(t, "arn:new-default", loaded.ImageARN, "default ARN updated")
+	got, ok := loaded.Image("api")
+	assert.True(t, ok, "custom images must survive a default re-cache")
+	assert.Equal(t, "arn:api", got)
+}
+
 func TestCommandsRegistered(t *testing.T) {
 	cmds := rootCmd.Commands()
 	names := make(map[string]bool, len(cmds))

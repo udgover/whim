@@ -131,23 +131,12 @@ func (m *Manager) GetImage(ctx context.Context, identifier string) (*ImageBuild,
 func (m *Manager) EnsureImage(ctx context.Context, spec ImageSpec) (string, error) {
 	arn := m.imageARN(spec.Name)
 
-	build, err := m.GetImage(ctx, arn)
-	switch {
-	case err == nil:
-		// Image exists — interpret its state; never re-build an existing image.
-		switch build.State {
-		case imageStateCreated, imageStateUpdated:
-			return arn, nil
-		case imageStateCreating, imageStateUpdating:
-			return m.pollUntilCreated(ctx, arn)
-		case imageStateCreateFailed, imageStateUpdateFailed:
-			return "", fmt.Errorf("%w: image %q is in %s state", ErrImageBuildFailed, spec.Name, build.State)
-		default:
-			return "", fmt.Errorf("%w: image %q is in unexpected state %s", ErrImageBuildFailed, spec.Name, build.State)
-		}
-	case !errors.Is(err, ErrImageNotFound):
-		// A real error (permissions, throttling, transient) — do not blindly build.
+	resolved, found, err := m.reuseImage(ctx, arn, spec.Name)
+	if err != nil {
 		return "", err
+	}
+	if found {
+		return resolved, nil
 	}
 
 	// Image is genuinely absent — submit a fresh build.
@@ -156,6 +145,34 @@ func (m *Manager) EnsureImage(ctx context.Context, spec ImageSpec) (string, erro
 	}
 	m.log().Info("image build submitted", "name", spec.Name, "arn", arn)
 	return m.pollUntilCreated(ctx, arn)
+}
+
+// reuseImage interprets the state of an existing image and returns its usable
+// ARN, polling an in-progress build to completion. found is false (with no
+// error) only when the image is genuinely absent (ErrImageNotFound), signalling
+// the caller to build; any other lookup error is returned and never built over.
+// An existing image is never rebuilt here — that would conflict on its name.
+func (m *Manager) reuseImage(ctx context.Context, arn, name string) (string, bool, error) {
+	build, err := m.GetImage(ctx, arn)
+	switch {
+	case err == nil:
+		switch build.State {
+		case imageStateCreated, imageStateUpdated:
+			return arn, true, nil
+		case imageStateCreating, imageStateUpdating:
+			resolved, perr := m.pollUntilCreated(ctx, arn)
+			return resolved, true, perr
+		case imageStateCreateFailed, imageStateUpdateFailed:
+			return "", true, fmt.Errorf("%w: image %q is in %s state", ErrImageBuildFailed, name, build.State)
+		default:
+			return "", true, fmt.Errorf("%w: image %q is in unexpected state %s", ErrImageBuildFailed, name, build.State)
+		}
+	case errors.Is(err, ErrImageNotFound):
+		return "", false, nil
+	default:
+		// A real error (permissions, throttling, transient) — do not blindly build.
+		return "", false, err
+	}
 }
 
 // DeleteImage deletes the image with the given ARN. It is idempotent: an
@@ -173,11 +190,19 @@ func (m *Manager) DeleteImage(ctx context.Context, identifier string) error {
 // fresh. Destructive: the prior image and its versions are removed.
 func (m *Manager) ForceRebuildImage(ctx context.Context, spec ImageSpec) (string, error) {
 	arn := m.imageARN(spec.Name)
-	if err := m.DeleteImage(ctx, arn); err != nil {
+	if err := m.deleteAndWaitGone(ctx, arn, spec.Name); err != nil {
 		return "", err
 	}
-	// Wait until the image is fully gone (GetImage reports not-found) before
-	// rebuilding — a lingering DELETING/CREATED resource would conflict on the name.
+	return m.EnsureImage(ctx, spec)
+}
+
+// deleteAndWaitGone deletes the image and waits until it is fully gone (GetImage
+// reports not-found) before returning, so the freed name can be rebuilt — a
+// lingering DELETING/CREATED resource would conflict on the unique name.
+func (m *Manager) deleteAndWaitGone(ctx context.Context, arn, name string) error {
+	if err := m.DeleteImage(ctx, arn); err != nil {
+		return err
+	}
 	if err := m.poll(ctx, func(ctx context.Context) (bool, error) {
 		_, gerr := m.GetImage(ctx, arn)
 		if errors.Is(gerr, ErrImageNotFound) {
@@ -188,9 +213,9 @@ func (m *Manager) ForceRebuildImage(ctx context.Context, spec ImageSpec) (string
 		}
 		return false, nil // still present — keep waiting
 	}); err != nil {
-		return "", fmt.Errorf("waiting for image %q deletion: %w", spec.Name, err)
+		return fmt.Errorf("waiting for image %q deletion: %w", name, err)
 	}
-	return m.EnsureImage(ctx, spec)
+	return nil
 }
 
 // pollUntilCreated polls GetImage for the given ARN until the image reaches a

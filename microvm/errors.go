@@ -7,6 +7,12 @@ import "errors"
 var (
 	// ErrInvalidOption is returned when a functional option receives an invalid value.
 	ErrInvalidOption = errors.New("microvm: invalid option")
+	// ErrInvalidSource is returned when a build source cannot be classified as a
+	// supported transport (local path, s3://, https://) or carries credentials.
+	ErrInvalidSource = errors.New("microvm: invalid source")
+	// ErrSourceTooLarge is returned when a staged build context exceeds a
+	// configured size or file-count cap.
+	ErrSourceTooLarge = errors.New("microvm: source exceeds size cap")
 	// ErrTokenExpired is returned when the shell auth token has expired.
 	ErrTokenExpired = errors.New("microvm: shell token expired")
 	// ErrVMProvisionFailed is returned when a MicroVM fails to reach RUNNING.

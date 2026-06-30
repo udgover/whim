@@ -11,6 +11,37 @@ import (
 type Config struct {
 	// ImageARN is the ARN of the whim default image built by `whim init`.
 	ImageARN string `json:"image_arn,omitempty"`
+	// Images maps a custom image name (as passed to `whim build --name`) to its
+	// built ARN. It is additive: older configs with only image_arn load fine,
+	// and the default image continues to live in ImageARN.
+	Images map[string]string `json:"images,omitempty"`
+}
+
+// Image returns the cached ARN for a custom image name, and whether it exists.
+func (c *Config) Image(name string) (string, bool) {
+	arn, ok := c.Images[name]
+	return arn, ok
+}
+
+// SetImage records the built ARN for a custom image name, creating the map on
+// first use. A repeated name overwrites, since the name is the build cache key.
+func (c *Config) SetImage(name, arn string) {
+	if c.Images == nil {
+		c.Images = make(map[string]string)
+	}
+	c.Images[name] = arn
+}
+
+// cacheDefaultImage updates only the default image ARN in the persisted config,
+// preserving any custom Images map. Use this instead of writing a fresh Config,
+// which would silently drop images cached by `whim build --name`.
+func cacheDefaultImage(arn string) error {
+	cfg, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+	cfg.ImageARN = arn
+	return SaveConfig(cfg)
 }
 
 // ConfigPath returns the path to the whim config file.
