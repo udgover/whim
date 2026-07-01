@@ -97,7 +97,7 @@ func schemeOf(source string) string {
 			}
 			continue
 		}
-		if !(isAlpha || (r >= '0' && r <= '9') || r == '+' || r == '.' || r == '-') {
+		if !isAlpha && (r < '0' || r > '9') && r != '+' && r != '.' && r != '-' {
 			return "" // not a valid scheme token → treat as local path
 		}
 	}

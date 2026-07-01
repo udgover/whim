@@ -117,7 +117,7 @@ func rerootZip(archive []byte, contextSubdir string, caps stagingCaps) ([]byte, 
 			return nil, fmt.Errorf("%w: open entry %q: %v", ErrInvalidSource, clean, err)
 		}
 		content, err := io.ReadAll(io.LimitReader(rc, remaining+1))
-		rc.Close()
+		_ = rc.Close()
 		if err != nil {
 			return nil, fmt.Errorf("%w: read entry %q: %v", ErrInvalidSource, clean, err)
 		}
@@ -204,7 +204,7 @@ func hasDriveLetter(p string) bool {
 		return false
 	}
 	c := p[0]
-	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+	if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
 		return false
 	}
 	return len(p) == 2 || p[2] == '/' || p[2] == '\\'
