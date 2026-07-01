@@ -27,12 +27,3 @@ func TestBuildZip_ProducesReadableArchive(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, content, got)
 }
-
-func TestDefaultBucketName_Format(t *testing.T) {
-	assert.Equal(t, "whim-artifacts-123456789012-us-east-1",
-		defaultBucketName("123456789012", "us-east-1"))
-}
-
-func TestDefaultBuildRoleName_Stable(t *testing.T) {
-	assert.Equal(t, "whim-build-role", defaultBuildRoleName())
-}

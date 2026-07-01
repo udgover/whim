@@ -66,11 +66,60 @@ go install ./cmd/whim
 | `whim gc` [`--older-than <dur>`] [`--yes`] | Terminate your whim VMs (confirms unless `--yes`). |
 | `whim suspend <id>` / `whim resume <id>` | Pause/restart a VM (disk + memory preserved). |
 | `whim image ls` [`-q`] [`--json`] / `whim image rm <name…>` | Manage built images. |
+| `whim build <source> --name <n>` [`--egress public\|none`] [`--force`] [`--context-subdir <p>`] [`--json`] | Build a custom image from a local dir/Dockerfile, `s3://`/`https://` archive, or `github.com/org/repo@ref`; caches the ARN under `--name`. |
 | `whim init` [`--image-name <n>`] [`--force`] / `whim preflight-check` / `whim version` | Bootstrap, checks, version. |
 
 Global flags: `--region`, `--profile`. `shell`/`run` also take `--image <name|arn>`
 and `--ttl <dur>`. `run`/`exec`/`put`/`get` exit **125** for whim-level failures
 (distinct from a remote command's own code).
+
+## Building custom images (`whim build`)
+
+`whim init` builds the *default* image; `whim build` builds *custom* images from
+your own source and caches each one by `--name` (the name is the build/reuse
+key) alongside the default in `~/.config/whim/config.json`. It reuses the same
+bootstrap (artifact bucket, build role, managed base image) as `init`.
+
+```bash
+whim build ./app          --name whim-app                       # local build context (Dockerfile at its root)
+whim build ./Dockerfile   --name whim-min  --egress none        # a single local Dockerfile, airgapped image
+whim build s3://my-bucket/app.zip            --name whim-s3 --json
+whim build https://example.com/app.zip       --name whim-https
+GITHUB_TOKEN=… whim build github.com/org/repo@<full-sha> --name whim-repo --force
+```
+
+Sources: a local directory or Dockerfile, an `s3://bucket/key`, an
+`https://host/path` (zip archive or raw Dockerfile), or **GitHub shorthand**
+`github.com/org/repo@ref` / `git+https://github.com/org/repo@ref`. GitHub
+shorthand is CLI-only — it lowers to an HTTPS archive download (no `git` needed);
+the `microvm` library transports are local, `s3://`, and `https://` only.
+
+- **`--name` is required** and is the cache key: a second `whim build --name X`
+  reuses the existing image `X` unless you pass `--force` (which deletes and
+  rebuilds). Name-as-key means a changed source does **not** rebuild on its own.
+- **`--egress public|none`** fixes the image's outbound policy at build time
+  (inherited by every VM launched from it). `none` is airgapped.
+- **`--context-subdir <p>`** descends into a subdirectory before locating the
+  `Dockerfile` (also strips a single wrapping top-level dir from forge archives).
+- **`--json`** prints one redacted object `{name, arn, source, cached, egress}`
+  and suppresses progress chatter.
+- **GitHub auth:** set `GITHUB_TOKEN` for private repos — it is sent only as a
+  request header, never placed in a URL, printed, logged, or written to config.
+  A full commit SHA ref is an immutable source identity; branches/tags are moving.
+
+**Source safety & limits.** Every source — local, S3, and HTTPS alike — is
+validated and normalized before any image build: archives are re-rooted, and
+absolute/`..`/duplicate paths and root-escaping symlinks are rejected. Caps are
+**256 MiB compressed, 1 GiB uncompressed, and 10,000 files**. A `.dockerignore`
+at the context root is honored for a **documented subset**: blank lines, `#`
+comments, `!` negation, leading-`/` anchoring, trailing-`/` directory matches,
+and `*`/`?` single-segment globs. Unsupported constructs (`**` cross-segment
+globs and `[…]` character classes) are **rejected** rather than mis-applied, so a
+wrong ignore rule can't silently ship excluded files.
+
+**Not in v0.1:** private-ECR base images (the build role's IAM is intentionally
+not widened until that path is validated) — `whim build` builds on the managed
+base image, same as `init`.
 
 ## Library
 
@@ -96,8 +145,29 @@ sb.Suspend(ctx); sb.Resume(ctx)
 mgr.List(ctx); mgr.GC(ctx, microvm.GCFilter{OlderThan: time.Hour})
 ```
 
+To build a custom image from source, the library takes **explicit build
+inputs** — there is no ambient discovery (the CLI owns that). The caller
+supplies the artifact bucket, base image, and build role; GitHub shorthand and
+default-bootstrap convenience live in the CLI, not here:
+
+```go
+arn, err := mgr.BuildFromSource(ctx, "./app", microvm.BuildFromSourceOptions{
+    Name:           "whim-app",            // image name = reuse/cache key (required)
+    ArtifactBucket: "my-artifact-bucket",  // caller-owned; staged context uploads here (required)
+    BaseImageARN:   baseImageARN,          // managed/base image to build on (required)
+    BuildRoleARN:   buildRoleARN,          // role the build assumes to read the staged artifact (required)
+    Egress:         microvm.EgressNone,    // outbound policy, fixed at build time
+    // Force, ContextSubdir, HTTPSHeaders, MaxCompressedBytes, MaxUncompressedBytes …
+})
+```
+
+`source` resolves to exactly one transport — a local path, `s3://bucket/key`, or
+`https://host/path`; `http://`, credential-bearing URL userinfo, and unknown
+schemes are rejected.
+
 Errors are typed sentinels (match with `errors.Is`): `ErrInvalidOption`,
-`ErrImageNotFound`, `ErrVMProvisionFailed`, `ErrConnClosed`, `ErrTimeout`,
+`ErrInvalidSource`, `ErrSourceTooLarge`, `ErrImageNotFound`,
+`ErrVMProvisionFailed`, `ErrImageBuildFailed`, `ErrConnClosed`, `ErrTimeout`,
 `ErrTerminated`. For tests, inject a mock via `NewWithAPI`.
 
 ## Security model
@@ -138,6 +208,27 @@ explicit `whim suspend <foreign-id>` could affect someone else's workload.
 - **Transfers are in-memory**, capped at 256 MiB per `put`/`get`.
 - **Reconnect yields a new shell** (disk persists, in-memory shell state does not).
 - Terminal **resize isn't forwarded** yet (full-screen apps use the default size).
+
+## Tests
+
+Unit tests are hermetic (no AWS, no network):
+
+```bash
+go test ./...
+```
+
+Live AWS integration tests are build-tagged and opt-in — they provision and
+build real images using your `whim init` artifact bucket and build role:
+
+```bash
+WHIM_INTEGRATION=1 go test -tags=integration ./...
+```
+
+The local-directory and `--egress none` builds run as-is; set
+`WHIM_TEST_HTTPS_ZIP` (an `https://` zip whose Dockerfile is at the root) and
+`WHIM_TEST_GITHUB=org/repo@<full-sha>` (plus `GITHUB_TOKEN` for private repos) to
+exercise the remote-source paths. Override the derived inputs with
+`WHIM_TEST_ARTIFACT_BUCKET` / `WHIM_TEST_BUILD_ROLE` / `WHIM_TEST_BASE_IMAGE`.
 
 ## License
 

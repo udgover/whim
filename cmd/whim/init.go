@@ -18,7 +18,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/lambdamicrovms"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/spf13/cobra"
 
 	"github.com/udgover/whim/microvm"
@@ -66,50 +65,26 @@ func runInit(cmd *cobra.Command, _ []string) error {
 	imageName, _ := cmd.Flags().GetString("image-name")
 	force, _ := cmd.Flags().GetBool("force")
 
-	// Resolve account ID — needed for resource naming and ARN construction.
-	out, err := sts.NewFromConfig(cfg).GetCallerIdentity(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("resolve account ID: %w", err)
-	}
-	accountID := aws.ToString(out.Account)
-	region := cfg.Region
-
-	printOut(cmd, "Initialising whim in account %s / region %s\n", accountID, region)
-
-	// Step 1: S3 bucket.
-	bucket := defaultBucketName(accountID, region)
-	if err := ensureBucket(ctx, cfg, bucket, region, cmd); err != nil {
-		return err
-	}
-
-	// Step 2: IAM build role.
-	roleName := defaultBuildRoleName()
-	roleARN, err := ensureBuildRole(ctx, cfg, roleName, bucket, cmd)
+	// Shared bootstrap: caller identity, artifact bucket, build role, base image.
+	env, err := resolveBuildEnv(ctx, cfg, cmd)
 	if err != nil {
 		return err
 	}
-
-	// Step 3: Managed base image ARN.
-	baseARN, err := managedBaseImageARN(ctx, cfg)
-	if err != nil {
-		return fmt.Errorf("list managed images: %w", err)
-	}
-	printOut(cmd, "  Using base image: %s\n", baseARN)
 
 	// Step 4: Upload the Dockerfile zip (keyed by image name) and build/reuse.
 	artifactKey := imageName + ".zip"
-	if err := uploadDefaultDockerfile(ctx, cfg, bucket, artifactKey); err != nil {
+	if err := uploadDefaultDockerfile(ctx, cfg, env.bucket, artifactKey); err != nil {
 		return fmt.Errorf("upload Dockerfile: %w", err)
 	}
 
 	mgr := microvm.NewFromConfig(cfg,
-		microvm.WithAccountID(accountID),
+		microvm.WithAccountID(env.accountID),
 	)
 	spec := microvm.ImageSpec{
 		Name:            imageName,
-		BaseImageARN:    baseARN,
-		CodeArtifactURI: fmt.Sprintf("s3://%s/%s", bucket, artifactKey),
-		BuildRoleARN:    roleARN,
+		BaseImageARN:    env.baseImageARN,
+		CodeArtifactURI: fmt.Sprintf("s3://%s/%s", env.bucket, artifactKey),
+		BuildRoleARN:    env.buildRoleARN,
 		Egress:          microvm.EgressPublic,
 	}
 
@@ -129,7 +104,7 @@ func runInit(cmd *cobra.Command, _ []string) error {
 	// Step 5: Cache as the active default only when building the default image —
 	// a custom --image-name builds without disturbing the active default.
 	if imageName == defaultImageName {
-		if err := SaveConfig(&Config{ImageARN: imageARN}); err != nil {
+		if err := cacheDefaultImage(imageARN); err != nil {
 			return fmt.Errorf("save config: %w", err)
 		}
 		printOut(cmd, "  Cached to: %s\n", ConfigPath())
@@ -157,16 +132,6 @@ func buildAWSConfig(ctx context.Context, cmd *cobra.Command) (aws.Config, error)
 		return cfg, errors.New("no AWS region configured — pass --region or set AWS_REGION / a profile region")
 	}
 	return cfg, nil
-}
-
-// defaultBucketName returns the deterministic S3 bucket name for whim artifacts.
-func defaultBucketName(accountID, region string) string {
-	return fmt.Sprintf("whim-artifacts-%s-%s", accountID, region)
-}
-
-// defaultBuildRoleName returns the IAM build role name (account-scoped, fixed).
-func defaultBuildRoleName() string {
-	return "whim-build-role"
 }
 
 func ensureBucket(ctx context.Context, cfg aws.Config, bucket, region string, cmd *cobra.Command) error {

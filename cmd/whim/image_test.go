@@ -7,11 +7,32 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/udgover/whim/microvm"
 )
+
+func TestClearCacheIfMatches_PreservesCustomImages(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("WHIM_CONFIG_DIR", dir)
+	cfg := &Config{ImageARN: "arn:default"}
+	cfg.SetImage("api", "arn:api")
+	require.NoError(t, SaveConfig(cfg))
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	clearCacheIfMatches(cmd, "arn:default", false)
+
+	loaded, err := LoadConfig()
+	require.NoError(t, err)
+	assert.Empty(t, loaded.ImageARN, "the matching default ARN is cleared")
+	got, ok := loaded.Image("api")
+	assert.True(t, ok, "custom images must survive default-image cache clearing")
+	assert.Equal(t, "arn:api", got)
+}
 
 func TestImageCommandsRegistered(t *testing.T) {
 	var imageCmdFound bool

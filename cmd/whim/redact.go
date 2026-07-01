@@ -1,8 +1,10 @@
 package main
 
 import (
+	"net/url"
 	"os"
 	"regexp"
+	"strings"
 )
 
 // accountMask replaces an AWS account ID in whim's own output. It is 12
@@ -20,6 +22,39 @@ var accountIDRe = regexp.MustCompile(`\b\d{12}\b`)
 // redactEnabled reports whether WHIM_REDACT_ACCOUNT=1 requests account masking.
 func redactEnabled() bool {
 	return os.Getenv("WHIM_REDACT_ACCOUNT") == "1"
+}
+
+// sensitiveSourceQuery lists URL query parameter names whose values can carry
+// credentials or presigned-request signatures. Compared case-insensitively.
+// Errs toward over-redaction: masking a benign param only costs display clarity.
+var sensitiveSourceQuery = map[string]bool{
+	"token": true, "access_token": true, "api_key": true, "apikey": true,
+	"key": true, "sig": true, "signature": true, "code": true,
+	"x-amz-signature": true, "x-amz-credential": true, "x-amz-security-token": true,
+}
+
+// redactSourceCreds returns a display-safe build source: URL userinfo is
+// stripped and known auth-sensitive query values are masked. Local paths,
+// s3:// URIs without a query, and unparseable strings are returned unchanged.
+// Always route a source through this before printing it (JSON or chrome).
+func redactSourceCreds(source string) string {
+	u, err := url.Parse(source)
+	if err != nil || u.Scheme == "" {
+		return source // local path or not URL-shaped → nothing to redact
+	}
+	if u.User != nil {
+		u.User = url.User("REDACTED")
+	}
+	if u.RawQuery != "" {
+		q := u.Query()
+		for k := range q {
+			if sensitiveSourceQuery[strings.ToLower(k)] {
+				q.Set(k, "REDACTED")
+			}
+		}
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
 }
 
 // redactAccountID masks AWS account IDs in whim's OWN (chrome) output —

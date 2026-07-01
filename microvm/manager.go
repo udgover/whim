@@ -3,6 +3,7 @@ package microvm
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,6 +16,8 @@ import (
 // NewWithAPI (testing). Manager is safe for concurrent use.
 type Manager struct {
 	api          awsapi.API
+	artifacts    artifactStore
+	httpClient   *http.Client
 	region       string
 	accountID    string
 	pollInterval time.Duration
@@ -55,6 +58,7 @@ func NewFromConfig(cfg aws.Config, opts ...Option) *Manager {
 		pollInterval: 5 * time.Second,
 	}
 	m.api = sdkclient.New(cfg)
+	m.artifacts = newS3ArtifactStore(cfg)
 	for _, opt := range opts {
 		opt(m)
 	}

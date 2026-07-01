@@ -262,7 +262,9 @@ func clearCacheIfMatches(cmd *cobra.Command, arn string, verbose bool) {
 	if err != nil || cfg.ImageARN != arn {
 		return
 	}
-	if err := SaveConfig(&Config{}); err != nil {
+	// Clear only the default ARN; preserve any custom images cached by build.
+	cfg.ImageARN = ""
+	if err := SaveConfig(cfg); err != nil {
 		if verbose {
 			printErr(cmd, "warning: failed to clear cached image: %v\n", err)
 		}
