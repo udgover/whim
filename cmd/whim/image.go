@@ -259,18 +259,26 @@ func renderRmResults(w io.Writer, results []rmResult) error {
 // image just deleted, so the cache never points at a removed image.
 func clearCacheIfMatches(cmd *cobra.Command, arn string, verbose bool) {
 	cfg, err := LoadConfig()
-	if err != nil || cfg.ImageARN != arn {
+	if err != nil {
 		return
 	}
-	// Clear only the default ARN; preserve any custom images cached by build.
-	cfg.ImageARN = ""
+	clearedDefault := cfg.ImageARN == arn
+	if clearedDefault {
+		cfg.ImageARN = ""
+	}
+	// Prune any custom image entry pointing at the deleted ARN; unrelated custom
+	// images are preserved.
+	prunedCustom := cfg.removeImageByARN(arn)
+	if !clearedDefault && !prunedCustom {
+		return
+	}
 	if err := SaveConfig(cfg); err != nil {
 		if verbose {
-			printErr(cmd, "warning: failed to clear cached image: %v\n", err)
+			printErr(cmd, "warning: failed to update cached images: %v\n", err)
 		}
 		return
 	}
-	if verbose {
+	if verbose && clearedDefault {
 		printOut(cmd, "cleared cached default image (was %s); run 'whim init' to rebuild\n", arn)
 	}
 }

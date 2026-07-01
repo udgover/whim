@@ -212,6 +212,8 @@ func TestBuildFromSourceValidation(t *testing.T) {
 		{name: "missing build role arn", mutate: func(o *BuildFromSourceOptions) { o.BuildRoleARN = "" }, wantErr: true},
 		{name: "egress vpc rejected", mutate: func(o *BuildFromSourceOptions) { o.Egress = EgressVPC }, wantErr: true},
 		{name: "unknown egress rejected", mutate: func(o *BuildFromSourceOptions) { o.Egress = EgressMode(99) }, wantErr: true},
+		{name: "capability all accepted", mutate: func(o *BuildFromSourceOptions) { o.Capabilities = []Capability{CapabilityAll} }, wantErr: false},
+		{name: "unsupported capability rejected", mutate: func(o *BuildFromSourceOptions) { o.Capabilities = []Capability{"BOGUS"} }, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

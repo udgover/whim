@@ -29,7 +29,7 @@ func (m *Manager) BuildFromSource(ctx context.Context, source string, opts Build
 			return "", err
 		}
 	} else {
-		resolved, found, err := m.reuseImage(ctx, arn, opts.Name)
+		resolved, found, err := m.reuseImage(ctx, arn, opts.Name, opts.Capabilities)
 		if err != nil {
 			return "", err
 		}
@@ -48,6 +48,7 @@ func (m *Manager) BuildFromSource(ctx context.Context, source string, opts Build
 		CodeArtifactURI: uri,
 		BuildRoleARN:    opts.BuildRoleARN,
 		Egress:          opts.Egress,
+		Capabilities:    opts.Capabilities,
 	})
 }
 
@@ -113,6 +114,9 @@ type BuildFromSourceOptions struct {
 	CacheKey string
 	// SourceIdentity records an immutable source identity (e.g. a full commit SHA).
 	SourceIdentity string
+	// Capabilities grants elevated OS capabilities to the built image (AWS
+	// additionalOsCapabilities). Leave nil for a default, minimal-cap image.
+	Capabilities []Capability
 }
 
 // stagingCaps holds the resolved size/count limits enforced while staging a
@@ -161,8 +165,8 @@ func (o BuildFromSourceOptions) validate() error {
 	}
 	switch o.Egress {
 	case EgressPublic, EgressNone:
-		return nil
 	default:
 		return fmt.Errorf("%w: egress must be EgressPublic or EgressNone", ErrInvalidOption)
 	}
+	return validateCapabilities(o.Capabilities)
 }

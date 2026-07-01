@@ -21,6 +21,10 @@ var (
 	ErrImageBuildFailed = errors.New("microvm: image build failed")
 	// ErrImageNotFound is returned when a requested MicroVM image does not exist.
 	ErrImageNotFound = errors.New("microvm: image not found")
+	// ErrCapabilityMismatch is returned when an existing image is reused but its
+	// OS capabilities differ from those requested, so reuse would silently grant
+	// or drop privilege. Rebuild (Force) to resolve.
+	ErrCapabilityMismatch = errors.New("microvm: image capabilities differ from request")
 	// ErrConnClosed is returned when the WebSocket connection is closed unexpectedly.
 	ErrConnClosed = errors.New("microvm: connection closed")
 	// ErrTimeout is returned when an operation exceeds its deadline.

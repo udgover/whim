@@ -28,7 +28,7 @@ func TestBuildCmd_RequiresExactlyOneSource(t *testing.T) {
 }
 
 func TestBuildFlags_Present(t *testing.T) {
-	for _, name := range []string{"name", "egress", "force", "context-subdir", "json"} {
+	for _, name := range []string{"name", "egress", "force", "context-subdir", "json", "privileged"} {
 		assert.NotNilf(t, buildCmd.Flags().Lookup(name), "build must define --%s", name)
 	}
 	assert.Equal(t, "public", buildCmd.Flags().Lookup("egress").DefValue, "egress defaults to public")

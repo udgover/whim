@@ -38,6 +38,7 @@ func init() {
 	buildCmd.Flags().String("name", "", "image name (required; the build cache key)")
 	buildCmd.Flags().String("egress", "public", "outbound network policy: public|none")
 	buildCmd.Flags().Bool("force", false, "delete and rebuild even if the image exists (destructive)")
+	buildCmd.Flags().Bool("privileged", false, "grant all elevated OS capabilities (mount, netns, eBPF, nested containers); baked at build time")
 	buildCmd.Flags().String("context-subdir", "", "build-context subdirectory to descend into before locating the Dockerfile")
 	buildCmd.Flags().Bool("json", false, "print a single JSON object instead of human progress")
 	_ = buildCmd.MarkFlagRequired("name")
@@ -83,6 +84,7 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	name, _ := cmd.Flags().GetString("name")
 	egressFlag, _ := cmd.Flags().GetString("egress")
 	force, _ := cmd.Flags().GetBool("force")
+	privileged, _ := cmd.Flags().GetBool("privileged")
 	contextSubdir, _ := cmd.Flags().GetString("context-subdir")
 	jsonOut, _ := cmd.Flags().GetBool("json")
 
@@ -139,6 +141,9 @@ func runBuild(cmd *cobra.Command, args []string) error {
 		ContextSubdir:  contextSubdir,
 		HTTPSHeaders:   httpsHeaders,
 		SourceIdentity: sourceIdentity,
+	}
+	if privileged {
+		opts.Capabilities = []microvm.Capability{microvm.CapabilityAll}
 	}
 
 	// Determine cache status for reporting: a non-force build over an existing

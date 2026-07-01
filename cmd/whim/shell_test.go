@@ -130,6 +130,23 @@ func TestResolveShellImageARN_NoDefaultErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "whim init", "the error must point the user at `whim init`")
 }
 
+func TestShellFlags_PrivilegedPresent(t *testing.T) {
+	for _, c := range []*cobra.Command{shellCmd, runCmd, rootCmd} {
+		assert.NotNilf(t, c.Flags().Lookup("privileged"),
+			"%q must define --privileged", c.Name())
+	}
+}
+
+func TestResolveShellImageARN_PrivilegedAndImage_Conflict(t *testing.T) {
+	cmd := newTestShellCmd()
+	require.NoError(t, cmd.Flags().Set("image", "arn:aws:lambda:us-east-1:123456789012:microvm-image:x"))
+	require.NoError(t, cmd.Flags().Set("privileged", "true"))
+
+	_, err := resolveShellImageARN(context.Background(), cmd, aws.Config{})
+	require.Error(t, err, "--privileged with an explicit --image must be rejected before any AWS call")
+	assert.Contains(t, err.Error(), "mutually exclusive")
+}
+
 // Bare `whim` (no subcommand) must drop into a shell, so root needs a RunE and a
 // registered `shell` subcommand alias.
 func TestRootWiresShell(t *testing.T) {

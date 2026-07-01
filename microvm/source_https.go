@@ -74,7 +74,7 @@ func (m *Manager) stageHTTPSSource(ctx context.Context, src classifiedSource, op
 	if err != nil {
 		return "", fmt.Errorf("https request %s: %w", redactSource(src.raw), scrubURLError(err))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("%w: %s returned HTTP %d", ErrInvalidSource, redactSource(src.raw), resp.StatusCode)
 	}

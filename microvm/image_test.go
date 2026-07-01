@@ -62,6 +62,166 @@ func TestBuildImage_CallsCreateMicrovmImage_WithCorrectFields(t *testing.T) {
 	assert.Len(t, mock.CreateMicrovmImageCalls, 1)
 }
 
+func TestCapabilityAll_HasExpectedValue(t *testing.T) {
+	// The wire value must be exactly "ALL" — the only value AWS accepts today.
+	assert.Equal(t, microvm.Capability("ALL"), microvm.CapabilityAll)
+}
+
+func TestBuildImage_Capabilities_ForwardedAsStrings(t *testing.T) {
+	mock := &awsapi.Mock{}
+	mock.CreateMicrovmImageFn = func(_ context.Context, _ *awsapi.CreateMicrovmImageInput) (*awsapi.CreateMicrovmImageOutput, error) {
+		return &awsapi.CreateMicrovmImageOutput{ImageARN: "arn:x", State: "CREATING"}, nil
+	}
+	spec := testSpec()
+	spec.Capabilities = []microvm.Capability{microvm.CapabilityAll}
+	_, err := newTestManager(mock).BuildImage(context.Background(), spec)
+	require.NoError(t, err)
+	require.Len(t, mock.CreateMicrovmImageCalls, 1)
+	assert.Equal(t, []string{"ALL"}, mock.CreateMicrovmImageCalls[0].Capabilities,
+		"typed capabilities must lower to plain strings at the awsapi boundary")
+}
+
+func TestBuildImage_NoCapabilities_SendsNil(t *testing.T) {
+	mock := &awsapi.Mock{}
+	mock.CreateMicrovmImageFn = func(_ context.Context, _ *awsapi.CreateMicrovmImageInput) (*awsapi.CreateMicrovmImageOutput, error) {
+		return &awsapi.CreateMicrovmImageOutput{ImageARN: "arn:x", State: "CREATING"}, nil
+	}
+	_, err := newTestManager(mock).BuildImage(context.Background(), testSpec())
+	require.NoError(t, err)
+	require.Len(t, mock.CreateMicrovmImageCalls, 1)
+	assert.Nil(t, mock.CreateMicrovmImageCalls[0].Capabilities,
+		"a default (minimal-cap) image must send no capabilities field")
+}
+
+func TestBuildImage_RejectsUnsupportedCapability(t *testing.T) {
+	mock := &awsapi.Mock{}
+	spec := testSpec()
+	spec.Capabilities = []microvm.Capability{"BOGUS"}
+	_, err := newTestManager(mock).BuildImage(context.Background(), spec)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, microvm.ErrInvalidOption)
+	assert.Empty(t, mock.CreateMicrovmImageCalls, "an invalid capability must fail before any AWS call")
+}
+
+// createdImageWithCaps wires a mock whose image exists (CREATED) with the given
+// baked capabilities, and fails the test if a rebuild is attempted.
+func createdImageWithCaps(t *testing.T, caps []string) *awsapi.Mock {
+	t.Helper()
+	const arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image:whim-test"
+	mock := &awsapi.Mock{}
+	mock.GetMicrovmImageFn = func(_ context.Context, _ *awsapi.GetMicrovmImageInput) (*awsapi.GetMicrovmImageOutput, error) {
+		return &awsapi.GetMicrovmImageOutput{ImageARN: arn, State: "CREATED", LatestActiveImageVersion: "1.0"}, nil
+	}
+	mock.GetMicrovmImageVersionFn = func(_ context.Context, _ *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
+		return &awsapi.GetMicrovmImageVersionOutput{Capabilities: caps}, nil
+	}
+	mock.CreateMicrovmImageFn = func(_ context.Context, _ *awsapi.CreateMicrovmImageInput) (*awsapi.CreateMicrovmImageOutput, error) {
+		t.Fatalf("must not rebuild an existing image")
+		return nil, nil
+	}
+	return mock
+}
+
+func TestEnsureImage_ReusesWhenCapabilitiesMatch(t *testing.T) {
+	mock := createdImageWithCaps(t, []string{"ALL"})
+	spec := testSpec()
+	spec.Capabilities = []microvm.Capability{microvm.CapabilityAll}
+
+	got, err := newTestManager(mock).EnsureImage(context.Background(), spec)
+	require.NoError(t, err)
+	assert.Equal(t, "arn:aws:lambda:us-east-1:123456789012:microvm-image:whim-test", got)
+	assert.Empty(t, mock.CreateMicrovmImageCalls)
+}
+
+func TestEnsureImage_RejectsReuse_WantPrivilegedHaveNot(t *testing.T) {
+	mock := createdImageWithCaps(t, nil) // existing image has no caps
+	spec := testSpec()
+	spec.Capabilities = []microvm.Capability{microvm.CapabilityAll}
+
+	_, err := newTestManager(mock).EnsureImage(context.Background(), spec)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, microvm.ErrCapabilityMismatch,
+		"a privileged request must not silently reuse an unprivileged image")
+}
+
+func TestEnsureImage_RejectsReuse_HavePrivilegedWantNot(t *testing.T) {
+	mock := createdImageWithCaps(t, []string{"ALL"}) // existing image is privileged
+	spec := testSpec()                               // request has no caps
+
+	_, err := newTestManager(mock).EnsureImage(context.Background(), spec)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, microvm.ErrCapabilityMismatch,
+		"a non-privileged request must not silently reuse a privileged image")
+}
+
+func TestEnsureImage_ReusesIgnoringDuplicateCapabilities(t *testing.T) {
+	mock := createdImageWithCaps(t, []string{"ALL", "ALL"}) // duplicated in the response
+	spec := testSpec()
+	spec.Capabilities = []microvm.Capability{microvm.CapabilityAll}
+
+	got, err := newTestManager(mock).EnsureImage(context.Background(), spec)
+	require.NoError(t, err, "duplicate capabilities denote the same set and must still match")
+	assert.NotEmpty(t, got)
+	assert.Empty(t, mock.CreateMicrovmImageCalls)
+}
+
+// deleteRefusingMock fails the test if any delete is attempted, proving
+// validation runs before the destructive step.
+func deleteRefusingMock(t *testing.T) *awsapi.Mock {
+	t.Helper()
+	mock := &awsapi.Mock{}
+	mock.DeleteMicrovmImageFn = func(_ context.Context, _ *awsapi.DeleteMicrovmImageInput) error {
+		t.Fatalf("ForceRebuildImage must validate the spec before deleting")
+		return nil
+	}
+	return mock
+}
+
+func TestForceRebuildImage_ValidatesCapabilityBeforeDelete(t *testing.T) {
+	mock := deleteRefusingMock(t)
+	spec := testSpec()
+	spec.Capabilities = []microvm.Capability{"BOGUS"}
+
+	_, err := newTestManager(mock).ForceRebuildImage(context.Background(), spec)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, microvm.ErrInvalidOption)
+	assert.Empty(t, mock.DeleteMicrovmImageCalls, "the existing image must survive an invalid spec")
+}
+
+func TestForceRebuildImage_ValidatesEgressBeforeDelete(t *testing.T) {
+	mock := deleteRefusingMock(t)
+	spec := testSpec()
+	spec.Egress = microvm.EgressVPC // unsupported
+
+	_, err := newTestManager(mock).ForceRebuildImage(context.Background(), spec)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, microvm.ErrInvalidOption)
+	assert.Empty(t, mock.DeleteMicrovmImageCalls)
+}
+
+func TestForceRebuildImage_ValidatesRequiredFieldsBeforeDelete(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*microvm.ImageSpec)
+	}{
+		{"missing name", func(s *microvm.ImageSpec) { s.Name = "" }},
+		{"missing base image ARN", func(s *microvm.ImageSpec) { s.BaseImageARN = "" }},
+		{"missing code artifact URI", func(s *microvm.ImageSpec) { s.CodeArtifactURI = "" }},
+		{"missing build role ARN", func(s *microvm.ImageSpec) { s.BuildRoleARN = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := deleteRefusingMock(t)
+			spec := testSpec()
+			tc.mutate(&spec)
+
+			_, err := newTestManager(mock).ForceRebuildImage(context.Background(), spec)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, microvm.ErrInvalidOption)
+			assert.Empty(t, mock.DeleteMicrovmImageCalls, "the existing image must survive an incomplete spec")
+		})
+	}
+}
+
 func TestBuildImage_EgressNone_SendsEmptyConnectors(t *testing.T) {
 	mock := &awsapi.Mock{}
 	mock.CreateMicrovmImageFn = func(_ context.Context, in *awsapi.CreateMicrovmImageInput) (*awsapi.CreateMicrovmImageOutput, error) {

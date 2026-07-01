@@ -159,14 +159,29 @@ func (c *Client) ListMicrovms(ctx context.Context, in *awsapi.ListMicrovmsInput)
 	return &awsapi.ListMicrovmsOutput{Items: items}, nil
 }
 
+// sdkCapabilities lifts the plain capability strings carried across the awsapi
+// boundary into the SDK's typed Capability slice. Returns nil for an empty
+// input so the request omits additionalOsCapabilities entirely.
+func sdkCapabilities(caps []string) []sdktypes.Capability {
+	if len(caps) == 0 {
+		return nil
+	}
+	out := make([]sdktypes.Capability, len(caps))
+	for i, c := range caps {
+		out[i] = sdktypes.Capability(c)
+	}
+	return out
+}
+
 // CreateMicrovmImage delegates to the SDK, wrapping the code artifact as a URI union member.
 func (c *Client) CreateMicrovmImage(ctx context.Context, in *awsapi.CreateMicrovmImageInput) (*awsapi.CreateMicrovmImageOutput, error) {
 	out, err := c.sdk.CreateMicrovmImage(ctx, &lambdamicrovms.CreateMicrovmImageInput{
-		Name:                    aws.String(in.Name),
-		BaseImageArn:            aws.String(in.BaseImageARN),
-		BuildRoleArn:            aws.String(in.BuildRoleARN),
-		CodeArtifact:            &sdktypes.CodeArtifactMemberUri{Value: in.CodeArtifactURI},
-		EgressNetworkConnectors: in.EgressConnectors,
+		Name:                     aws.String(in.Name),
+		BaseImageArn:             aws.String(in.BaseImageARN),
+		BuildRoleArn:             aws.String(in.BuildRoleARN),
+		CodeArtifact:             &sdktypes.CodeArtifactMemberUri{Value: in.CodeArtifactURI},
+		EgressNetworkConnectors:  in.EgressConnectors,
+		AdditionalOsCapabilities: sdkCapabilities(in.Capabilities),
 	})
 	if err != nil {
 		return nil, err
@@ -176,6 +191,24 @@ func (c *Client) CreateMicrovmImage(ctx context.Context, in *awsapi.CreateMicrov
 		ImageVersion: aws.ToString(out.ImageVersion),
 		State:        string(out.State),
 	}, nil
+}
+
+// GetMicrovmImageVersion delegates to the SDK and returns the version's
+// additionalOsCapabilities as plain strings. A not-found version is reported as
+// awsapi.ErrNotFound.
+func (c *Client) GetMicrovmImageVersion(ctx context.Context, in *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
+	out, err := c.sdk.GetMicrovmImageVersion(ctx, &lambdamicrovms.GetMicrovmImageVersionInput{
+		ImageIdentifier: aws.String(in.ImageIdentifier),
+		ImageVersion:    aws.String(in.ImageVersion),
+	})
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	caps := make([]string, len(out.AdditionalOsCapabilities))
+	for i, c := range out.AdditionalOsCapabilities {
+		caps[i] = string(c)
+	}
+	return &awsapi.GetMicrovmImageVersionOutput{Capabilities: caps}, nil
 }
 
 // GetMicrovmImage delegates to the SDK and maps the image state fields.

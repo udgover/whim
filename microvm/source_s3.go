@@ -56,7 +56,7 @@ func (m *Manager) readS3Head(ctx context.Context, bucket, key string, n int64) (
 	if err != nil {
 		return nil, err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	return io.ReadAll(io.LimitReader(rc, n))
 }
 
@@ -67,7 +67,7 @@ func (m *Manager) readS3Object(ctx context.Context, bucket, key string, limit in
 	if err != nil {
 		return nil, fmt.Errorf("read source object: %w", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	data, err := io.ReadAll(io.LimitReader(rc, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("read source object: %w", err)

@@ -61,6 +61,8 @@ func addShellFlags(cmd *cobra.Command) {
 		"image name or ARN to launch (default: the cached image from `whim init`)")
 	cmd.Flags().Duration("ttl", defaultShellTTL,
 		"server-side max lifetime for the VM — cleanup backstop, must be ≤ 8h")
+	cmd.Flags().Bool("privileged", false,
+		"launch the whim-privileged image (all OS capabilities: mount, netns, eBPF, nested containers); auto-built on first use")
 }
 
 var shellCmd = &cobra.Command{
@@ -122,6 +124,14 @@ func runShell(cmd *cobra.Command, _ []string) error {
 // the cached default image from `whim init`.
 func resolveShellImageARN(ctx context.Context, cmd *cobra.Command, cfg aws.Config) (string, error) {
 	image, _ := cmd.Flags().GetString("image")
+	// --privileged always launches the well-known whim-privileged image, so an
+	// explicit --image alongside it is ambiguous; reject before any AWS call.
+	if privileged, _ := cmd.Flags().GetBool("privileged"); privileged {
+		if image != "" {
+			return "", errors.New("--privileged and --image are mutually exclusive: --privileged always launches the whim-privileged image")
+		}
+		return ensurePrivilegedImage(ctx, cfg, cmd)
+	}
 	if image == "" {
 		wcfg, err := LoadConfig()
 		if err != nil {

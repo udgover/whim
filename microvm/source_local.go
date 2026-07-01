@@ -186,7 +186,7 @@ func readCapped(p string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open %q: %w", p, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	content, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("read %q: %w", p, err)

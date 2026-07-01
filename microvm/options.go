@@ -157,4 +157,19 @@ type ImageSpec struct {
 	Egress EgressMode
 	// Resources sets the baseline memory allocation for the image.
 	Resources *Resources
+	// Capabilities grants elevated Linux OS capabilities to the image's
+	// runtime environment (AWS additionalOsCapabilities). Fixed at build time.
+	// AWS supports exactly one value today: CapabilityAll. Leave nil for the
+	// default, minimal-capability image.
+	Capabilities []Capability
 }
+
+// Capability is an elevated Linux OS capability granted to a MicroVM image via
+// AWS's additionalOsCapabilities. Modelled as a slice-friendly string type so
+// the surface stays forward-compatible if AWS adds finer-grained values.
+type Capability string
+
+// CapabilityAll grants all available OS capabilities to the image runtime,
+// enabling privileged operations such as mounting filesystems, creating network
+// namespaces, and running eBPF programs. It is the only value AWS supports today.
+const CapabilityAll Capability = "ALL"
