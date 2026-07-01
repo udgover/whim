@@ -32,6 +32,20 @@ func (c *Config) SetImage(name, arn string) {
 	c.Images[name] = arn
 }
 
+// removeImageByARN deletes any custom image entries whose cached ARN equals
+// arn, returning whether anything was removed. Used to prune the cache after a
+// successful `whim image rm` so a deleted image is not left dangling.
+func (c *Config) removeImageByARN(arn string) bool {
+	removed := false
+	for name, a := range c.Images {
+		if a == arn {
+			delete(c.Images, name)
+			removed = true
+		}
+	}
+	return removed
+}
+
 // cacheDefaultImage updates only the default image ARN in the persisted config,
 // preserving any custom Images map. Use this instead of writing a fresh Config,
 // which would silently drop images cached by `whim build --name`.

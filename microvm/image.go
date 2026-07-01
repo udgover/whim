@@ -76,10 +76,121 @@ func egressConnectors(mode EgressMode, region string) ([]string, error) {
 	}
 }
 
+// validateCapabilities rejects any capability whose value AWS does not accept.
+// Only CapabilityAll is supported today; bad library input fails locally with
+// ErrInvalidOption rather than round-tripping to AWS.
+func validateCapabilities(caps []Capability) error {
+	for _, c := range caps {
+		if c != CapabilityAll {
+			return fmt.Errorf("%w: unsupported capability %q (only %q is supported)", ErrInvalidOption, c, CapabilityAll)
+		}
+	}
+	return nil
+}
+
+// validateImageSpec checks a spec's required build fields, capabilities, and
+// egress mode with no side effects, so callers can reject bad input before any
+// destructive or AWS action (notably ForceRebuildImage's delete). It never
+// mutates state.
+func (m *Manager) validateImageSpec(spec ImageSpec) error {
+	switch {
+	case spec.Name == "":
+		return fmt.Errorf("%w: image name is required", ErrInvalidOption)
+	case spec.BaseImageARN == "":
+		return fmt.Errorf("%w: base image ARN is required", ErrInvalidOption)
+	case spec.CodeArtifactURI == "":
+		return fmt.Errorf("%w: code artifact URI is required", ErrInvalidOption)
+	case spec.BuildRoleARN == "":
+		return fmt.Errorf("%w: build role ARN is required", ErrInvalidOption)
+	}
+	if err := validateCapabilities(spec.Capabilities); err != nil {
+		return err
+	}
+	if _, err := egressConnectors(spec.Egress, m.region); err != nil {
+		return err
+	}
+	return nil
+}
+
+// capabilitiesEqual reports whether two capability slices denote the same set,
+// independent of order and duplication.
+func capabilitiesEqual(a, b []Capability) bool {
+	set := func(caps []Capability) map[Capability]struct{} {
+		s := make(map[Capability]struct{}, len(caps))
+		for _, c := range caps {
+			s[c] = struct{}{}
+		}
+		return s
+	}
+	sa, sb := set(a), set(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for c := range sa {
+		if _, ok := sb[c]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// ImageCapabilities returns the elevated OS capabilities baked into an image's
+// latest active version (empty for a default, minimal-cap image).
+func (m *Manager) ImageCapabilities(ctx context.Context, arn string) ([]Capability, error) {
+	img, err := m.GetImage(ctx, arn)
+	if err != nil {
+		return nil, err
+	}
+	ver, err := m.api.GetMicrovmImageVersion(ctx, &awsapi.GetMicrovmImageVersionInput{
+		ImageIdentifier: arn,
+		ImageVersion:    img.ImageVersion,
+	})
+	if err != nil {
+		return nil, err
+	}
+	caps := make([]Capability, len(ver.Capabilities))
+	for i, c := range ver.Capabilities {
+		caps[i] = Capability(c)
+	}
+	return caps, nil
+}
+
+// checkReuseCapabilities enforces the capability contract before an existing
+// image is reused: its baked capabilities must match those requested, else
+// reuse would silently grant or drop privilege.
+func (m *Manager) checkReuseCapabilities(ctx context.Context, arn, name string, want []Capability) error {
+	have, err := m.ImageCapabilities(ctx, arn)
+	if err != nil {
+		return fmt.Errorf("verify capabilities of existing image %q: %w", name, err)
+	}
+	if !capabilitiesEqual(have, want) {
+		return fmt.Errorf("%w: existing image %q has %v but %v was requested; rebuild with --force",
+			ErrCapabilityMismatch, name, have, want)
+	}
+	return nil
+}
+
+// capabilityStrings lowers the typed Capability slice to the plain strings the
+// awsapi boundary carries. Returns nil for an empty slice so no capabilities
+// field is sent for the default, minimal-cap image.
+func capabilityStrings(caps []Capability) []string {
+	if len(caps) == 0 {
+		return nil
+	}
+	out := make([]string, len(caps))
+	for i, c := range caps {
+		out[i] = string(c)
+	}
+	return out
+}
+
 // BuildImage submits an asynchronous image build and returns the initial state.
 // It does NOT poll for completion — call EnsureImage for the full build-and-wait
 // lifecycle, or use GetImage to poll manually.
 func (m *Manager) BuildImage(ctx context.Context, spec ImageSpec) (*ImageBuild, error) {
+	if err := m.validateImageSpec(spec); err != nil {
+		return nil, err
+	}
 	connectors, err := egressConnectors(spec.Egress, m.region)
 	if err != nil {
 		return nil, err
@@ -90,6 +201,7 @@ func (m *Manager) BuildImage(ctx context.Context, spec ImageSpec) (*ImageBuild, 
 		CodeArtifactURI:  spec.CodeArtifactURI,
 		BuildRoleARN:     spec.BuildRoleARN,
 		EgressConnectors: connectors,
+		Capabilities:     capabilityStrings(spec.Capabilities),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build image %q: %w", spec.Name, err)
@@ -129,9 +241,12 @@ func (m *Manager) GetImage(ctx context.Context, identifier string) (*ImageBuild,
 // A fresh build is submitted only when the image is genuinely absent
 // (ErrImageNotFound); any other lookup error is returned, never built over.
 func (m *Manager) EnsureImage(ctx context.Context, spec ImageSpec) (string, error) {
+	if err := m.validateImageSpec(spec); err != nil {
+		return "", err
+	}
 	arn := m.imageARN(spec.Name)
 
-	resolved, found, err := m.reuseImage(ctx, arn, spec.Name)
+	resolved, found, err := m.reuseImage(ctx, arn, spec.Name, spec.Capabilities)
 	if err != nil {
 		return "", err
 	}
@@ -152,21 +267,28 @@ func (m *Manager) EnsureImage(ctx context.Context, spec ImageSpec) (string, erro
 // error) only when the image is genuinely absent (ErrImageNotFound), signalling
 // the caller to build; any other lookup error is returned and never built over.
 // An existing image is never rebuilt here — that would conflict on its name.
-func (m *Manager) reuseImage(ctx context.Context, arn, name string) (string, bool, error) {
+func (m *Manager) reuseImage(ctx context.Context, arn, name string, wantCaps []Capability) (string, bool, error) {
 	build, err := m.GetImage(ctx, arn)
 	switch {
 	case err == nil:
 		switch build.State {
 		case imageStateCreated, imageStateUpdated:
-			return arn, true, nil
+			// usable now — fall through to the capability check.
 		case imageStateCreating, imageStateUpdating:
-			resolved, perr := m.pollUntilCreated(ctx, arn)
-			return resolved, true, perr
+			if _, perr := m.pollUntilCreated(ctx, arn); perr != nil {
+				return "", true, perr
+			}
 		case imageStateCreateFailed, imageStateUpdateFailed:
 			return "", true, fmt.Errorf("%w: image %q is in %s state", ErrImageBuildFailed, name, build.State)
 		default:
 			return "", true, fmt.Errorf("%w: image %q is in unexpected state %s", ErrImageBuildFailed, name, build.State)
 		}
+		// Capabilities are part of the reuse contract: never reuse an image whose
+		// privilege differs from what was requested.
+		if err := m.checkReuseCapabilities(ctx, arn, name, wantCaps); err != nil {
+			return "", true, err
+		}
+		return arn, true, nil
 	case errors.Is(err, ErrImageNotFound):
 		return "", false, nil
 	default:
@@ -189,6 +311,11 @@ func (m *Manager) DeleteImage(ctx context.Context, identifier string) error {
 // deletion to fully complete (the name must be free to rebuild), then builds it
 // fresh. Destructive: the prior image and its versions are removed.
 func (m *Manager) ForceRebuildImage(ctx context.Context, spec ImageSpec) (string, error) {
+	// Validate before deleting: an invalid spec must never cost the caller their
+	// existing image.
+	if err := m.validateImageSpec(spec); err != nil {
+		return "", err
+	}
 	arn := m.imageARN(spec.Name)
 	if err := m.deleteAndWaitGone(ctx, arn, spec.Name); err != nil {
 		return "", err

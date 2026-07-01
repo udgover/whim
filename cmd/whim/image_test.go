@@ -34,6 +34,28 @@ func TestClearCacheIfMatches_PreservesCustomImages(t *testing.T) {
 	assert.Equal(t, "arn:api", got)
 }
 
+func TestClearCacheIfMatches_PrunesDeletedCustomImage(t *testing.T) {
+	t.Setenv("WHIM_CONFIG_DIR", t.TempDir())
+	cfg := &Config{ImageARN: "arn:default"}
+	cfg.SetImage("api", "arn:api")
+	cfg.SetImage("web", "arn:web")
+	require.NoError(t, SaveConfig(cfg))
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	clearCacheIfMatches(cmd, "arn:api", false)
+
+	loaded, err := LoadConfig()
+	require.NoError(t, err)
+	_, ok := loaded.Image("api")
+	assert.False(t, ok, "the deleted custom image's entry must be pruned from the cache")
+	got, ok := loaded.Image("web")
+	assert.True(t, ok, "unrelated custom images must survive")
+	assert.Equal(t, "arn:web", got)
+	assert.Equal(t, "arn:default", loaded.ImageARN, "the default ARN is untouched when a custom image is removed")
+}
+
 func TestImageCommandsRegistered(t *testing.T) {
 	var imageCmdFound bool
 	for _, c := range rootCmd.Commands() {

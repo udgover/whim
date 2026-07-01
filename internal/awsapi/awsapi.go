@@ -96,6 +96,9 @@ type CreateMicrovmImageInput struct {
 	CodeArtifactURI  string
 	BuildRoleARN     string
 	EgressConnectors []string
+	// Capabilities are elevated OS capabilities (additionalOsCapabilities),
+	// carried as plain strings across this boundary; nil for the default image.
+	Capabilities []string
 }
 
 // CreateMicrovmImageOutput holds the resulting image ARN and version.
@@ -116,6 +119,18 @@ type GetMicrovmImageOutput struct {
 	Name                     string
 	State                    string
 	LatestActiveImageVersion string
+}
+
+// GetMicrovmImageVersionInput identifies a specific version of an image.
+type GetMicrovmImageVersionInput struct {
+	ImageIdentifier string
+	ImageVersion    string
+}
+
+// GetMicrovmImageVersionOutput exposes the version-level fields whim consumes.
+// Capabilities mirrors additionalOsCapabilities as plain strings.
+type GetMicrovmImageVersionOutput struct {
+	Capabilities []string
 }
 
 // DeleteMicrovmImageInput identifies an image to delete.
@@ -161,6 +176,7 @@ type API interface {
 	ListMicrovms(ctx context.Context, in *ListMicrovmsInput) (*ListMicrovmsOutput, error)
 	CreateMicrovmImage(ctx context.Context, in *CreateMicrovmImageInput) (*CreateMicrovmImageOutput, error)
 	GetMicrovmImage(ctx context.Context, in *GetMicrovmImageInput) (*GetMicrovmImageOutput, error)
+	GetMicrovmImageVersion(ctx context.Context, in *GetMicrovmImageVersionInput) (*GetMicrovmImageVersionOutput, error)
 	DeleteMicrovmImage(ctx context.Context, in *DeleteMicrovmImageInput) error
 	ListMicrovmImages(ctx context.Context, in *ListMicrovmImagesInput) (*ListMicrovmImagesOutput, error)
 }

@@ -121,6 +121,36 @@ wrong ignore rule can't silently ship excluded files.
 not widened until that path is validated) — `whim build` builds on the managed
 base image, same as `init`.
 
+## Privileged shells (`--privileged`)
+
+A whim shell is **root**, but under a restricted Linux capability set — so `mount`,
+network namespaces, `unshare`, and eBPF are all denied (`EPERM`) even as uid 0.
+`--privileged` grants the image AWS's `additionalOsCapabilities: ["ALL"]`, which
+lifts the effective set to *all* capabilities. It is **opt-in**: default images
+stay minimal-cap and privilege is never granted implicitly.
+
+```bash
+whim --privileged                 # throwaway shell that can mount, netns, run eBPF
+whim run --privileged -- mount -t tmpfs none /mnt   # one-shot privileged command
+```
+
+`whim --privileged` launches the well-known **`whim-privileged`** image, building
+it on first use (~2-3 min, like `whim init`) and caching its ARN alongside your
+other images. It ships the tooling to *use* the caps — `util-linux` (mount,
+`unshare`), `iproute` (`ip netns`), `e2fsprogs` — since capabilities unlock
+syscalls, not binaries. `--privileged` and `--image` are mutually exclusive.
+
+To bake privilege into a **custom** image instead, use `whim build --privileged`:
+
+```bash
+whim build ./app --name whim-app --privileged     # your source + ALL capabilities
+```
+
+Capabilities are fixed at **build time** and inherited by every VM launched from
+the image. `ALL` is the only value AWS supports today. Elevated capabilities are
+applied **within the VM's isolation boundary** — per AWS, they do not affect the
+host or other MicroVMs.
+
 ## Library
 
 The `microvm` package is the product; the CLI is a thin client. It is
@@ -179,6 +209,10 @@ WebSocket. whim's guarantees:
   the request header).
 - **Injection-only credentials** — `microvm` never sources ambient credentials.
 - **Always a TTL** — no VM is launched without one (≤ 8h).
+- **Privilege is opt-in** — default images run with a restricted capability set;
+  `--privileged` (all OS capabilities) must be asked for explicitly, and its
+  reach is confined to the VM's isolation boundary (host and other MicroVMs are
+  unaffected).
 - **Ownership-scoped cleanup** — `ps`/`gc` only ever touch VMs launched from
   **your own account's microvm-images**; AWS-managed base images and other
   accounts' VMs are never listed or reaped. (Microvms can't be tagged, so

@@ -10,29 +10,31 @@ import (
 type Mock struct {
 	mu sync.Mutex
 
-	RunMicrovmFn           func(ctx context.Context, in *RunMicrovmInput) (*RunMicrovmOutput, error)
-	GetMicrovmFn           func(ctx context.Context, in *GetMicrovmInput) (*GetMicrovmOutput, error)
-	TerminateMicrovmFn     func(ctx context.Context, in *TerminateMicrovmInput) error
-	SuspendMicrovmFn       func(ctx context.Context, in *SuspendMicrovmInput) error
-	ResumeMicrovmFn        func(ctx context.Context, in *ResumeMicrovmInput) error
-	CreateShellAuthTokenFn func(ctx context.Context, in *CreateShellAuthTokenInput) (*CreateShellAuthTokenOutput, error)
-	ListMicrovmsFn         func(ctx context.Context, in *ListMicrovmsInput) (*ListMicrovmsOutput, error)
-	CreateMicrovmImageFn   func(ctx context.Context, in *CreateMicrovmImageInput) (*CreateMicrovmImageOutput, error)
-	GetMicrovmImageFn      func(ctx context.Context, in *GetMicrovmImageInput) (*GetMicrovmImageOutput, error)
-	DeleteMicrovmImageFn   func(ctx context.Context, in *DeleteMicrovmImageInput) error
-	ListMicrovmImagesFn    func(ctx context.Context, in *ListMicrovmImagesInput) (*ListMicrovmImagesOutput, error)
+	RunMicrovmFn             func(ctx context.Context, in *RunMicrovmInput) (*RunMicrovmOutput, error)
+	GetMicrovmFn             func(ctx context.Context, in *GetMicrovmInput) (*GetMicrovmOutput, error)
+	TerminateMicrovmFn       func(ctx context.Context, in *TerminateMicrovmInput) error
+	SuspendMicrovmFn         func(ctx context.Context, in *SuspendMicrovmInput) error
+	ResumeMicrovmFn          func(ctx context.Context, in *ResumeMicrovmInput) error
+	CreateShellAuthTokenFn   func(ctx context.Context, in *CreateShellAuthTokenInput) (*CreateShellAuthTokenOutput, error)
+	ListMicrovmsFn           func(ctx context.Context, in *ListMicrovmsInput) (*ListMicrovmsOutput, error)
+	CreateMicrovmImageFn     func(ctx context.Context, in *CreateMicrovmImageInput) (*CreateMicrovmImageOutput, error)
+	GetMicrovmImageFn        func(ctx context.Context, in *GetMicrovmImageInput) (*GetMicrovmImageOutput, error)
+	GetMicrovmImageVersionFn func(ctx context.Context, in *GetMicrovmImageVersionInput) (*GetMicrovmImageVersionOutput, error)
+	DeleteMicrovmImageFn     func(ctx context.Context, in *DeleteMicrovmImageInput) error
+	ListMicrovmImagesFn      func(ctx context.Context, in *ListMicrovmImagesInput) (*ListMicrovmImagesOutput, error)
 
-	RunMicrovmCalls           []*RunMicrovmInput
-	GetMicrovmCalls           []*GetMicrovmInput
-	TerminateMicrovmCalls     []*TerminateMicrovmInput
-	SuspendMicrovmCalls       []*SuspendMicrovmInput
-	ResumeMicrovmCalls        []*ResumeMicrovmInput
-	CreateShellAuthTokenCalls []*CreateShellAuthTokenInput
-	ListMicrovmsCalls         []*ListMicrovmsInput
-	CreateMicrovmImageCalls   []*CreateMicrovmImageInput
-	GetMicrovmImageCalls      []*GetMicrovmImageInput
-	DeleteMicrovmImageCalls   []*DeleteMicrovmImageInput
-	ListMicrovmImagesCalls    []*ListMicrovmImagesInput
+	RunMicrovmCalls             []*RunMicrovmInput
+	GetMicrovmCalls             []*GetMicrovmInput
+	TerminateMicrovmCalls       []*TerminateMicrovmInput
+	SuspendMicrovmCalls         []*SuspendMicrovmInput
+	ResumeMicrovmCalls          []*ResumeMicrovmInput
+	CreateShellAuthTokenCalls   []*CreateShellAuthTokenInput
+	ListMicrovmsCalls           []*ListMicrovmsInput
+	CreateMicrovmImageCalls     []*CreateMicrovmImageInput
+	GetMicrovmImageCalls        []*GetMicrovmImageInput
+	GetMicrovmImageVersionCalls []*GetMicrovmImageVersionInput
+	DeleteMicrovmImageCalls     []*DeleteMicrovmImageInput
+	ListMicrovmImagesCalls      []*ListMicrovmImagesInput
 }
 
 // Mock must always satisfy API; this guards against silent interface drift.
@@ -153,6 +155,20 @@ func (m *Mock) GetMicrovmImage(ctx context.Context, in *GetMicrovmImageInput) (*
 		return fn(ctx, in)
 	}
 	return nil, fmt.Errorf("mock: GetMicrovmImageFn not set")
+}
+
+// GetMicrovmImageVersion records a copy of the call and delegates to GetMicrovmImageVersionFn if set.
+func (m *Mock) GetMicrovmImageVersion(ctx context.Context, in *GetMicrovmImageVersionInput) (*GetMicrovmImageVersionOutput, error) {
+	m.mu.Lock()
+	cp := *in
+	m.GetMicrovmImageVersionCalls = append(m.GetMicrovmImageVersionCalls, &cp)
+	fn := m.GetMicrovmImageVersionFn
+	m.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, in)
+	}
+	// Benign default (like ListMicrovms): a version with no elevated capabilities.
+	return &GetMicrovmImageVersionOutput{}, nil
 }
 
 // DeleteMicrovmImage records a copy of the call and delegates to DeleteMicrovmImageFn if set.
