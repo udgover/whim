@@ -8,8 +8,11 @@ import (
 
 const (
 	maxTTL = 8 * time.Hour
-	// defaultTTL is below the default shell-token lifetime (~30 min) so a
-	// session never outlives its usable shell without reconnect support.
+	// defaultTTL is the server-side cleanup backstop for ephemeral VMs (shell/run/
+	// exec): short by design, so a forgotten or crashed client doesn't leave a
+	// billed VM running. It is not related to the shell-token lifetime — an
+	// established shell connection is never re-validated against its token and
+	// can outlive it fine (see ShellTokenLifetime's doc comment).
 	defaultTTL = 25 * time.Minute
 )
 

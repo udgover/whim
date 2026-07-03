@@ -49,6 +49,21 @@ func TestRenderVMList_JSON(t *testing.T) {
 	assert.NotEmpty(t, arr[0].StartedAt)
 }
 
+// TestRenderVMList_ShowsSuspendedState guards the persistent-boxes promise
+// that `whim ps` surfaces idled boxes: List already passes SUSPENDED through
+// untouched (microvm.TestList_OnlyAccountOwnedActiveVMs), and renderVMList
+// prints State verbatim with no state-based filtering — this proves the two
+// compose correctly end to end at the render layer.
+func TestRenderVMList_ShowsSuspendedState(t *testing.T) {
+	vms := []microvm.SandboxInfo{
+		{ID: "microvm-susp", ImageARN: "arn:aws:lambda:us-east-1:123456789012:microvm-image:whim-default", State: "SUSPENDED", StartedAt: time.Now().Add(-90 * time.Minute)},
+	}
+	var buf bytes.Buffer
+	require.NoError(t, renderVMList(&buf, vms, outputMode{}))
+	assert.Contains(t, buf.String(), "SUSPENDED")
+	assert.Contains(t, buf.String(), "microvm-susp")
+}
+
 func TestRenderVMList_Empty(t *testing.T) {
 	var buf bytes.Buffer
 	require.NoError(t, renderVMList(&buf, nil, outputMode{}))

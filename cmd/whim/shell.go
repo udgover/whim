@@ -94,10 +94,10 @@ func runShell(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	ttl, _ := cmd.Flags().GetDuration("ttl")
-	if ttl > microvm.ShellTokenLifetime {
-		printErr(cmd, "warning: --ttl %s exceeds the %s shell-token lifetime; the session will end at ~%s (no reconnect in v0.1). The VM is still terminated on disconnect.\n",
-			ttl, microvm.ShellTokenLifetime, microvm.ShellTokenLifetime)
-	}
+	// No shell-token-lifetime warning here: live testing confirmed an established
+	// shell connection is never re-validated against its token, so --ttl has no
+	// interaction with ShellTokenLifetime to warn about. --ttl alone bounds the
+	// session (the VM is terminated on disconnect, or at --ttl regardless).
 
 	mgr := microvm.NewFromConfig(cfg, microvm.WithPollInterval(shellLaunchPollInterval))
 

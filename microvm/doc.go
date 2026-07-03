@@ -17,7 +17,9 @@
 //
 // Manager owns images and VM lifecycle within one credential context:
 // BuildImage/EnsureImage/GetImage/ListImages/DeleteImage, Launch, Attach (an
-// existing RUNNING VM by id), List/GC (whim-owned VMs), Suspend/Resume.
+// existing RUNNING or SUSPENDED VM by id — SUSPENDED is resumed transparently
+// before the handle is returned), List/GC (whim-owned VMs), Suspend/Resume,
+// Terminate.
 //
 // Sandbox is a handle to one VM: Shell, Exec (combined output + exit code), Put,
 // Get, Suspend, Resume, Terminate (idempotent). Errors are typed sentinels
@@ -43,8 +45,11 @@
 //
 // # v0.1 limitations
 //
-// Exec returns combined stdout+stderr (a pty merges them). Interactive shells
-// are bounded by the ~30-minute shell-token lifetime (no reconnect; a reconnect
-// yields a fresh shell, disk-intact only). Put/Get hold the whole payload in
-// memory (256 MiB cap). Terminal resize is accepted but not yet forwarded.
+// Exec returns combined stdout+stderr (a pty merges them). An established
+// interactive shell is NOT bounded by the ~30-minute shell-token lifetime —
+// live testing confirmed the token is checked only at connect, never
+// re-validated — so its actual lifetime is the VM's own TTL/idle policy.
+// Reconnecting still yields a fresh shell, not continuity of the old one (no
+// session-state reconnect). Put/Get hold the whole payload in memory (256 MiB
+// cap). Terminal resize is accepted but not yet forwarded.
 package microvm
