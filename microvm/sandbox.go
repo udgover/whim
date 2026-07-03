@@ -11,9 +11,16 @@ import (
 	"github.com/udgover/whim/internal/wsconn"
 )
 
-// ShellTokenLifetime is how long a minted shell auth token stays valid. An
-// interactive session cannot outlive it (there is no reconnect in v0.1), so
-// callers should keep a VM's TTL at or below this.
+// ShellTokenLifetime is how long a freshly minted shell auth token is valid
+// for authenticating a NEW WebSocket handshake. It does NOT bound an
+// already-established connection: live testing (2026-07-02, held a session 90s
+// then 180s past a 1-minute token) confirmed the shell endpoint checks the
+// bearer token only at connect time and never re-validates it afterward. A
+// session's actual lifetime is governed by the VM's own TTL and idle policy,
+// not by this constant — and merely holding a shell connection open, even
+// silent (zero bytes sent), counts as keeping the box awake: idle-suspend does
+// not fire while a shell is attached (confirmed live, 2026-07-02; see
+// TestIntegration_OpenShellPreventsIdleSuspend).
 const ShellTokenLifetime = 30 * time.Minute
 
 // shellTokenExpiryMinutes is ShellTokenLifetime expressed for the mint API.
@@ -51,10 +58,18 @@ func (s *Sandbox) Endpoint() string { return s.endpoint }
 
 // Terminate terminates the MicroVM. It is idempotent: an already-gone VM is
 // treated as success, so it is safe to defer.
-func (s *Sandbox) Terminate(ctx context.Context) error {
-	err := s.mgr.api.TerminateMicrovm(ctx, &awsapi.TerminateMicrovmInput{MicrovmIdentifier: s.id})
+func (s *Sandbox) Terminate(ctx context.Context) error { return s.mgr.Terminate(ctx, s.id) }
+
+// Terminate terminates the MicroVM identified by id, without requiring a
+// Sandbox handle (so it works regardless of the VM's current state — unlike
+// Attach, which refuses anything but RUNNING/SUSPENDED). It is idempotent: an
+// already-gone VM is treated as success, matching Sandbox.Terminate. Used by
+// `whim rm`, which — like Suspend/Resume — acts on any id without an
+// ownership check.
+func (m *Manager) Terminate(ctx context.Context, id string) error {
+	err := m.api.TerminateMicrovm(ctx, &awsapi.TerminateMicrovmInput{MicrovmIdentifier: id})
 	if err != nil && !errors.Is(err, awsapi.ErrNotFound) {
-		return fmt.Errorf("terminate microvm %q: %w", s.id, err)
+		return fmt.Errorf("terminate microvm %q: %w", id, err)
 	}
 	return nil
 }
@@ -136,8 +151,11 @@ func (s *Sandbox) dialShell(ctx context.Context) (*wsconn.Conn, error) {
 // consumes no more bytes once the connection is closed, but it is not joined.
 // Library callers that need deterministic cleanup should pass an io.Reader they
 // can close (or that observes ctx) and must not reuse sio.In across calls while
-// a prior goroutine may still be blocked on it. A session cannot outlive the
-// shell token (ShellTokenLifetime) — there is no reconnect in v0.1.
+// a prior goroutine may still be blocked on it. A session's lifetime is bounded
+// by ctx and the VM's own TTL/idle policy, not by ShellTokenLifetime — an
+// established connection survives its minting token's expiry (confirmed live;
+// see ShellTokenLifetime's doc comment). Reconnecting (a new Shell call) still
+// yields a fresh remote shell, not continuity of this one.
 func (s *Sandbox) Shell(ctx context.Context, sio ShellIO) error {
 	if sio.Out == nil {
 		return fmt.Errorf("%w: ShellIO.Out is required", ErrInvalidOption)
@@ -191,13 +209,20 @@ func (s *Sandbox) Shell(ctx context.Context, sio ShellIO) error {
 }
 
 // Attach returns a Sandbox handle for an already-running MicroVM by ID, without
-// launching anything — used by `whim exec <id>`. It verifies the VM is RUNNING
-// and resolves its endpoint. A gone VM reads as ErrTerminated. The caller does
-// NOT own the VM's lifecycle (Attach never terminates it).
+// launching anything — used by `whim exec <id>` and friends. It verifies the
+// VM is usable and resolves its endpoint. A gone VM reads as ErrTerminated.
+// The caller does NOT own the VM's lifecycle (Attach never terminates it).
 //
-// NOTE: Attach does not verify whim-ownership — any RUNNING MicroVM ID in the
-// account can be attached (and exec'd into as root). VMs are untagged in v0.1;
-// ownership enforcement (refusing foreign VMs) is intentionally not done here.
+// A SUSPENDED VM is resumed transparently (Resume, then poll to RUNNING)
+// before the handle is returned — this is the single choke point exec/put/get
+// and interactive attach all route through, so "use wakes a suspended
+// persistent box" holds for all of them without each needing its own resume
+// logic.
+//
+// NOTE: Attach does not verify whim-ownership — any MicroVM ID in the account
+// can be attached (and exec'd into as root, or resumed). VMs are untagged in
+// v0.1; ownership enforcement (refusing foreign VMs) is intentionally not
+// done here.
 func (m *Manager) Attach(ctx context.Context, id string) (*Sandbox, error) {
 	if id == "" {
 		return nil, fmt.Errorf("%w: microvm id is required", ErrInvalidOption)
@@ -212,11 +237,47 @@ func (m *Manager) Attach(ctx context.Context, id string) (*Sandbox, error) {
 	switch g.State {
 	case "RUNNING":
 		return &Sandbox{mgr: m, id: id, endpoint: g.Endpoint}, nil
+	case "SUSPENDED":
+		return m.resumeAndAttach(ctx, id)
 	case "TERMINATING", "TERMINATED":
 		return nil, fmt.Errorf("%w: %q is %s", ErrTerminated, id, g.State)
 	default:
 		return nil, fmt.Errorf("%w: microvm %q is %s, not RUNNING", ErrInvalidOption, id, g.State)
 	}
+}
+
+// resumeAndAttach resumes a SUSPENDED VM and polls (via the shared poll loop,
+// so a stuck resume fails on ctx deadline instead of hanging) until it reaches
+// RUNNING, then returns its Sandbox handle. A VM that disappears or terminates
+// mid-resume surfaces as ErrTerminated rather than a bare poll error.
+func (m *Manager) resumeAndAttach(ctx context.Context, id string) (*Sandbox, error) {
+	if err := m.Resume(ctx, id); err != nil {
+		return nil, err
+	}
+	var sb *Sandbox
+	err := m.poll(ctx, func(ctx context.Context) (bool, error) {
+		g, gerr := m.api.GetMicrovm(ctx, &awsapi.GetMicrovmInput{MicrovmIdentifier: id})
+		if gerr != nil {
+			if errors.Is(gerr, awsapi.ErrNotFound) {
+				return false, fmt.Errorf("%w: %q", ErrTerminated, id)
+			}
+			return false, fmt.Errorf("polling resumed microvm %q: %w", id, gerr)
+		}
+		switch g.State {
+		case "RUNNING":
+			sb = &Sandbox{mgr: m, id: id, endpoint: g.Endpoint}
+			return true, nil
+		case "TERMINATING", "TERMINATED":
+			return false, fmt.Errorf("%w: %q entered %s while resuming", ErrTerminated, id, g.State)
+		default: // still SUSPENDED, or a transient resuming state
+			m.log().Debug("microvm resuming", "id", id, "state", g.State)
+			return false, nil
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sb, nil
 }
 
 // Launch runs a new MicroVM from imageARN and waits until it reaches RUNNING.

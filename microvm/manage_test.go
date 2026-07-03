@@ -23,6 +23,7 @@ func mixedFleet() *awsapi.Mock {
 		return &awsapi.ListMicrovmsOutput{Items: []awsapi.MicrovmSummary{
 			{MicrovmID: "vm-own-old", ImageARN: "arn:aws:lambda:us-east-1:123456789012:microvm-image:whim-default", State: "RUNNING", StartedAt: now.Add(-2 * time.Hour)},
 			{MicrovmID: "vm-own-new", ImageARN: "arn:aws:lambda:us-east-1:123456789012:microvm-image:whim-test", State: "PENDING", StartedAt: now.Add(-5 * time.Minute)},
+			{MicrovmID: "vm-own-suspended", ImageARN: "arn:aws:lambda:us-east-1:123456789012:microvm-image:whim-default", State: "SUSPENDED", StartedAt: now.Add(-90 * time.Minute)},
 			{MicrovmID: "vm-managed", ImageARN: "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1", State: "RUNNING", StartedAt: now.Add(-3 * time.Hour)},
 			{MicrovmID: "vm-foreign", ImageARN: "arn:aws:lambda:us-east-1:999999999999:microvm-image:other", State: "RUNNING", StartedAt: now.Add(-3 * time.Hour)},
 			{MicrovmID: "vm-own-term", ImageARN: "arn:aws:lambda:us-east-1:123456789012:microvm-image:whim-default", State: "TERMINATED", StartedAt: now.Add(-4 * time.Hour)},
@@ -47,9 +48,10 @@ func ids(infos []microvm.SandboxInfo) []string {
 func TestList_OnlyAccountOwnedActiveVMs(t *testing.T) {
 	infos, err := newTestManager(mixedFleet()).List(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, []string{"vm-own-new", "vm-own-old"}, ids(infos),
+	assert.Equal(t, []string{"vm-own-new", "vm-own-old", "vm-own-suspended"}, ids(infos),
 		"only account-owned microvm-image, non-terminated/terminating VMs — "+
-			"never AWS-managed, foreign, non-microvm-image (vm-func), malformed (vm-bad), or terminating (vm-own-terming)")
+			"never AWS-managed, foreign, non-microvm-image (vm-func), malformed (vm-bad), or terminating (vm-own-terming); "+
+			"SUSPENDED must pass through untouched so `whim ps` can show persistent boxes that are idled")
 }
 
 func TestList_RequiresAccountID(t *testing.T) {
@@ -63,14 +65,15 @@ func TestGC_ReapsOnlyOwned(t *testing.T) {
 	reaped, err := newTestManager(mock).GC(context.Background(), microvm.GCFilter{})
 	require.NoError(t, err)
 	sort.Strings(reaped)
-	assert.Equal(t, []string{"vm-own-new", "vm-own-old"}, reaped)
+	assert.Equal(t, []string{"vm-own-new", "vm-own-old", "vm-own-suspended"}, reaped,
+		"GC has no state filter — a SUSPENDED owned VM is reaped just like any other")
 
 	var terminated []string
 	for _, c := range mock.TerminateMicrovmCalls {
 		terminated = append(terminated, c.MicrovmIdentifier)
 	}
 	sort.Strings(terminated)
-	assert.Equal(t, []string{"vm-own-new", "vm-own-old"}, terminated,
+	assert.Equal(t, []string{"vm-own-new", "vm-own-old", "vm-own-suspended"}, terminated,
 		"GC must NEVER terminate AWS-managed (vm-managed) or foreign (vm-foreign) VMs")
 }
 
@@ -93,5 +96,7 @@ func TestGC_OlderThanFiltersByAge(t *testing.T) {
 	mock := mixedFleet()
 	reaped, err := newTestManager(mock).GC(context.Background(), microvm.GCFilter{OlderThan: 30 * time.Minute})
 	require.NoError(t, err)
-	assert.Equal(t, []string{"vm-own-old"}, reaped, "only VMs older than 30m (not the 5m-old one)")
+	sort.Strings(reaped)
+	assert.Equal(t, []string{"vm-own-old", "vm-own-suspended"}, reaped,
+		"only VMs older than 30m (not the 5m-old one); age, not state, gates OlderThan")
 }

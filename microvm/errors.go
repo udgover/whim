@@ -13,7 +13,10 @@ var (
 	// ErrSourceTooLarge is returned when a staged build context exceeds a
 	// configured size or file-count cap.
 	ErrSourceTooLarge = errors.New("microvm: source exceeds size cap")
-	// ErrTokenExpired is returned when the shell auth token has expired.
+	// ErrTokenExpired is reserved but not currently returned by any Manager or
+	// Sandbox method: live testing confirmed an established shell connection is
+	// never re-validated against its token (see ShellTokenLifetime), so there is
+	// no expiry condition to detect on that path. Kept for API compatibility.
 	ErrTokenExpired = errors.New("microvm: shell token expired")
 	// ErrVMProvisionFailed is returned when a MicroVM fails to reach RUNNING.
 	ErrVMProvisionFailed = errors.New("microvm: vm failed to reach running")

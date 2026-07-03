@@ -162,6 +162,84 @@ func TestAttach_RunningReturnsSandbox(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "mvm-existing", sb.ID())
 	assert.Equal(t, "ep-attach", sb.Endpoint())
+	assert.Empty(t, mock.ResumeMicrovmCalls, "an already-RUNNING VM must never be resumed")
+}
+
+// TestAttach_Suspended_ResumesAndPolls covers the persistent-boxes headline
+// behavior: exec/put/get/interactive-attach all route through Attach, so
+// resuming here transparently wakes a suspended box on any use.
+func TestAttach_Suspended_ResumesAndPolls(t *testing.T) {
+	mock := &awsapi.Mock{}
+	calls := 0
+	mock.GetMicrovmFn = func(_ context.Context, in *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		calls++
+		if calls == 1 {
+			return &awsapi.GetMicrovmOutput{MicrovmID: in.MicrovmIdentifier, State: "SUSPENDED"}, nil
+		}
+		return &awsapi.GetMicrovmOutput{MicrovmID: in.MicrovmIdentifier, Endpoint: "ep-resumed", State: "RUNNING"}, nil
+	}
+	mgr := microvm.NewWithAPI(mock,
+		microvm.WithRegion("us-east-1"), microvm.WithAccountID("123456789012"),
+		microvm.WithPollInterval(time.Millisecond),
+	)
+
+	sb, err := mgr.Attach(context.Background(), "mvm-susp")
+	require.NoError(t, err)
+	assert.Equal(t, "mvm-susp", sb.ID())
+	assert.Equal(t, "ep-resumed", sb.Endpoint())
+	require.Len(t, mock.ResumeMicrovmCalls, 1, "Attach must resume a SUSPENDED VM")
+	assert.Equal(t, "mvm-susp", mock.ResumeMicrovmCalls[0].MicrovmIdentifier)
+}
+
+func TestAttach_Suspended_TerminatedWhileResuming(t *testing.T) {
+	mock := &awsapi.Mock{}
+	calls := 0
+	mock.GetMicrovmFn = func(_ context.Context, in *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		calls++
+		if calls == 1 {
+			return &awsapi.GetMicrovmOutput{MicrovmID: in.MicrovmIdentifier, State: "SUSPENDED"}, nil
+		}
+		return &awsapi.GetMicrovmOutput{MicrovmID: in.MicrovmIdentifier, State: "TERMINATED"}, nil
+	}
+	mgr := microvm.NewWithAPI(mock,
+		microvm.WithRegion("us-east-1"), microvm.WithAccountID("123456789012"),
+		microvm.WithPollInterval(time.Millisecond),
+	)
+
+	_, err := mgr.Attach(context.Background(), "mvm-gone-mid-resume")
+	require.ErrorIs(t, err, microvm.ErrTerminated, "a VM that dies while resuming must surface as terminated, not a timeout")
+}
+
+func TestAttach_Suspended_StuckNeverRunning_ContextDeadline(t *testing.T) {
+	mock := &awsapi.Mock{}
+	mock.GetMicrovmFn = func(_ context.Context, in *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		return &awsapi.GetMicrovmOutput{MicrovmID: in.MicrovmIdentifier, State: "SUSPENDED"}, nil // never reaches RUNNING
+	}
+	mgr := microvm.NewWithAPI(mock,
+		microvm.WithRegion("us-east-1"), microvm.WithAccountID("123456789012"),
+		microvm.WithPollInterval(time.Millisecond),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := mgr.Attach(ctx, "mvm-stuck")
+	require.Error(t, err, "a VM stuck non-RUNNING while resuming must fail on ctx deadline, not hang forever")
+	assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
+}
+
+func TestAttach_Suspended_ResumeAPIFails(t *testing.T) {
+	mock := &awsapi.Mock{}
+	mock.GetMicrovmFn = func(_ context.Context, in *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		return &awsapi.GetMicrovmOutput{MicrovmID: in.MicrovmIdentifier, State: "SUSPENDED"}, nil
+	}
+	mock.ResumeMicrovmFn = func(_ context.Context, _ *awsapi.ResumeMicrovmInput) error {
+		return errors.New("resume denied")
+	}
+
+	_, err := newTestManager(mock).Attach(context.Background(), "mvm-resume-fail")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resume denied")
+	assert.Empty(t, mock.GetMicrovmCalls[1:], "must not poll after a failed Resume call")
 }
 
 func TestAttach_RequiresID(t *testing.T) {
@@ -230,6 +308,37 @@ func TestSandbox_Suspend_NotFound_IsTerminated(t *testing.T) {
 	require.NoError(t, err)
 
 	require.ErrorIs(t, sb.Suspend(context.Background()), microvm.ErrTerminated, "suspending a gone VM reads as terminated")
+}
+
+// TestManager_Terminate_CallsAPI covers by-id termination (used by `whim rm`),
+// which must work without first Attach-ing — Attach requires RUNNING/SUSPENDED
+// and would wrongly refuse to terminate a VM stuck in some other state.
+func TestManager_Terminate_CallsAPI(t *testing.T) {
+	mock := &awsapi.Mock{}
+	mgr := newTestManager(mock)
+
+	require.NoError(t, mgr.Terminate(context.Background(), "mvm-bare"))
+	require.Len(t, mock.TerminateMicrovmCalls, 1)
+	assert.Equal(t, "mvm-bare", mock.TerminateMicrovmCalls[0].MicrovmIdentifier)
+}
+
+func TestManager_Terminate_IdempotentOnNotFound(t *testing.T) {
+	mock := &awsapi.Mock{}
+	mock.TerminateMicrovmFn = func(_ context.Context, _ *awsapi.TerminateMicrovmInput) error {
+		return awsapi.ErrNotFound
+	}
+	require.NoError(t, newTestManager(mock).Terminate(context.Background(), "mvm-gone"),
+		"terminating an already-gone VM by id is a no-op, matching Sandbox.Terminate")
+}
+
+func TestManager_Terminate_SurfacesOtherErrors(t *testing.T) {
+	mock := &awsapi.Mock{}
+	mock.TerminateMicrovmFn = func(_ context.Context, _ *awsapi.TerminateMicrovmInput) error {
+		return errors.New("access denied")
+	}
+	err := newTestManager(mock).Terminate(context.Background(), "mvm-denied")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "access denied")
 }
 
 func TestSandbox_Terminate_IdempotentOnNotFound(t *testing.T) {

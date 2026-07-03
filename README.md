@@ -60,11 +60,14 @@ go install ./cmd/whim
 |---|---|
 | `whim` / `whim shell` | Launch a VM and attach an interactive root shell. **Ctrl-]** disconnects (every other key, incl. Ctrl-C, goes to the remote pty). |
 | `whim run -- <cmd…>` | Launch → run → stream combined output → propagate the exit code → terminate. |
-| `whim exec <id> -- <cmd…>` | Run a command in an existing VM. |
-| `whim put <id> <local> <remote-dir>` / `whim get <id> <remote> <local-dir>` | Copy files/dirs in or out (tar.gz, binary-safe, `scp -r`/`docker cp` semantics). |
+| `whim run -d` [`--idle <dur>`] [`--suspend-after <dur>`] [`--auto-resume`] | Launch a **persistent box** that outlives the process; prints the bare id and returns (see "Persistent boxes" below). |
+| `whim exec <id> -- <cmd…>` | Run a command in an existing VM (auto-resumes if suspended). |
+| `whim exec -it <id>` | Attach an interactive shell to an existing/suspended VM; **Ctrl-]** detaches without terminating it. Takes no trailing command. |
+| `whim put <id> <local> <remote-dir>` / `whim get <id> <remote> <local-dir>` | Copy files/dirs in or out (tar.gz, binary-safe, `scp -r`/`docker cp` semantics; auto-resumes if suspended). |
 | `whim ps` [`-q`] [`--json`] | List your whim VMs — running/pending/suspended, state-labeled (like `docker ps`). |
-| `whim gc` [`--older-than <dur>`] [`--yes`] | Terminate your whim VMs (confirms unless `--yes`). |
+| `whim gc` [`--older-than <dur>`] [`--yes`] | Terminate your whim-**owned** VMs in bulk (confirms unless `--yes`). |
 | `whim suspend <id>` / `whim resume <id>` | Pause/restart a VM (disk + memory preserved). |
+| `whim rm <id…>` | Terminate VMs **by id** — like `suspend`/`resume`/`exec`, no ownership check (contrast `gc`). Idempotent on an already-gone id. |
 | `whim image ls` [`-q`] [`--json`] / `whim image rm <name…>` | Manage built images. |
 | `whim build <source> --name <n>` [`--egress public\|none`] [`--force`] [`--context-subdir <p>`] [`--json`] | Build a custom image from a local dir/Dockerfile, `s3://`/`https://` archive, or `github.com/org/repo@ref`; caches the ARN under `--name`. |
 | `whim init` [`--image-name <n>`] [`--force`] / `whim preflight-check` / `whim version` | Bootstrap, checks, version. |
@@ -151,6 +154,55 @@ the image. `ALL` is the only value AWS supports today. Elevated capabilities are
 applied **within the VM's isolation boundary** — per AWS, they do not affect the
 host or other MicroVMs.
 
+## Persistent boxes (`run -d`, `exec -it`, `rm`)
+
+`whim shell`/`whim run` are disposable — the VM terminates when you disconnect or the
+command finishes. `whim run -d` instead launches a **persistent box**: a VM that
+outlives the process, which you reconnect to later with `whim exec -it`.
+
+```bash
+whim run -d --idle 15m --suspend-after 2h    # prints the id, returns immediately
+whim exec -it microvm-abc123                 # attach an interactive shell
+# ...work, then Ctrl-] to detach — the box keeps running...
+whim exec -it microvm-abc123                 # reconnect later: fresh shell, disk intact
+whim rm microvm-abc123                       # done — terminate it
+```
+
+- **`-d`/`--detach`** launches without attaching or terminating; the printed id is
+  bare (no timestamp) so it's scriptable: `id=$(whim run -d)`.
+- **`--idle <dur>` / `--suspend-after <dur>` / `--auto-resume`** configure the box's
+  idle policy (both durations require `-d`). While suspended you pay storage, not
+  compute; `exec`/`put`/`get`/`exec -it` all resume it transparently on first use.
+- **`whim exec -it <id>`** attaches an interactive shell to a running *or suspended*
+  box. Unlike `docker exec -it`, it takes **no trailing command** — the shell endpoint
+  always starts a fresh shell, with no way to select a program over that connection;
+  run your command once you're attached instead.
+- **`whim rm <id…>`** terminates by id (like `suspend`/`resume`/`exec` — no ownership
+  check; see Security model below). Idempotent on an already-gone id, and a failure on
+  one id in a list doesn't stop the rest from being attempted.
+
+**What persists across a detach/reconnect, and what doesn't:**
+- ✅ Files on disk, and any background process that's still running.
+- ❌ Your terminal state — the open editor, shell history-in-progress, current
+  directory. Reconnecting always gives you a **fresh shell** (same reconnect
+  semantics `whim shell` already has — see v0.1 limitations below). Run `tmux`
+  inside the box if you want the session itself, not just the disk, to survive.
+
+**The idle policy's real behavior — read this before relying on it for cost control.**
+Both directions were verified live, and one is the opposite of what you'd guess:
+- A box you've **detached** from (no attached shell) with a background job running
+  *does* suspend after `--idle` with no traffic — and the job actually freezes, not
+  just billing. It resumes (and the job continues) the next time anything touches it.
+- A box with an **attached shell — even sitting idle at the prompt, sending
+  nothing — does NOT suspend.** Merely holding the connection open counts as
+  traffic. So `whim exec -it <id>` left attached while you walk away keeps the box
+  **running and billed until `--ttl`, detach, or `rm`** — `--idle` only protects you
+  once you actually detach (Ctrl-]).
+- A session's actual lifetime is governed by the VM's own `--ttl` (hard cap, ≤8h) and
+  its idle policy — **not** by any client-side token-refresh mechanism. There isn't
+  one: an established shell connection is unaffected by its underlying auth token
+  expiring in the background.
+
 ## Library
 
 The `microvm` package is the product; the CLI is a thin client. It is
@@ -225,9 +277,9 @@ WebSocket. whim's guarantees:
 
 **Ownership model:** only the *heuristic bulk* commands `ps`/`gc` are scoped to
 whim-owned VMs. The **id-targeted** commands (`exec`, `put`, `get`, `suspend`,
-`resume`) act on **any** VM in your account that you explicitly name — like
-`ssh <host>`, naming the target is the authorization. In a shared account, an
-explicit `whim suspend <foreign-id>` could affect someone else's workload.
+`resume`, `rm`) act on **any** VM in your account that you explicitly name —
+like `ssh <host>`, naming the target is the authorization. In a shared account,
+an explicit `whim rm <foreign-id>` could **terminate** someone else's workload.
 
 ## v0.1 limitations
 
@@ -237,8 +289,6 @@ explicit `whim suspend <foreign-id>` could affect someone else's workload.
   microvm-images, scope `gc` carefully.
 - **Exec output is combined** stdout+stderr (a pty merges them); separate streams
   would need a guest agent.
-- **Interactive shells last ~30 min** (the shell-token lifetime); `--ttl` above
-  that doesn't extend the session (no reconnect in v0.1).
 - **Transfers are in-memory**, capped at 256 MiB per `put`/`get`.
 - **Reconnect yields a new shell** (disk persists, in-memory shell state does not).
 - Terminal **resize isn't forwarded** yet (full-screen apps use the default size).
