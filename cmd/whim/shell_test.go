@@ -99,8 +99,9 @@ func newTestShellCmd() *cobra.Command {
 	return c
 }
 
-// Image resolution precedence: explicit --image (ARN) > cached default > error.
-// The bare-name branch needs STS and is exercised live, not here.
+// Image resolution precedence: explicit --image (ARN) > cached named image >
+// cached default > error. Uncached bare names fall back to STS-derived ARN
+// construction and are exercised live, not here.
 
 func TestResolveShellImageARN_ExplicitARNWins(t *testing.T) {
 	const arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image:custom"
@@ -120,6 +121,103 @@ func TestResolveShellImageARN_FallsBackToCachedDefault(t *testing.T) {
 	got, err := resolveShellImageARN(context.Background(), newTestShellCmd(), aws.Config{})
 	require.NoError(t, err)
 	assert.Equal(t, arn, got, "with no --image, the cached default from `whim init` is used")
+}
+
+func TestResolveShellImageARN_UsesCachedNamedImage(t *testing.T) {
+	const arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image:airgap"
+	t.Setenv("WHIM_CONFIG_DIR", t.TempDir())
+	cfg := &Config{}
+	cfg.SetImage("airgap", arn)
+	require.NoError(t, SaveConfig(cfg))
+
+	cmd := newTestShellCmd()
+	require.NoError(t, cmd.Flags().Set("image", "airgap"))
+	got, err := resolveShellImageARN(context.Background(), cmd, aws.Config{})
+	require.NoError(t, err)
+	assert.Equal(t, arn, got)
+}
+
+func TestCachedNoPublicEgressExpectation_UsesCachedNamedImage(t *testing.T) {
+	t.Setenv("WHIM_CONFIG_DIR", t.TempDir())
+	cfg := &Config{}
+	cfg.SetImage("airgap", "arn:airgap")
+	cfg.SetEgress("airgap", "none")
+	cfg.SetEgressConnector("airgap", "arn:connector")
+	require.NoError(t, SaveConfig(cfg))
+
+	cmd := newTestShellCmd()
+	require.NoError(t, cmd.Flags().Set("image", "airgap"))
+	got, ok, err := cachedNoPublicEgressExpectation(cmd)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "arn:connector", got.ConnectorARN)
+}
+
+func TestCachedNoPublicEgressExpectation_UsesCachedARN(t *testing.T) {
+	t.Setenv("WHIM_CONFIG_DIR", t.TempDir())
+	const arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image:airgap"
+	cfg := &Config{}
+	cfg.SetImage("airgap", arn)
+	cfg.SetEgress("airgap", "none")
+	cfg.SetEgressConnector("airgap", "arn:connector")
+	require.NoError(t, SaveConfig(cfg))
+
+	cmd := newTestShellCmd()
+	require.NoError(t, cmd.Flags().Set("image", arn))
+	got, ok, err := cachedNoPublicEgressExpectation(cmd)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "arn:connector", got.ConnectorARN)
+}
+
+func TestCachedNoPublicEgressExpectation_WithoutConnectorErrors(t *testing.T) {
+	t.Setenv("WHIM_CONFIG_DIR", t.TempDir())
+	cfg := &Config{}
+	cfg.SetImage("airgap", "arn:airgap")
+	cfg.SetEgress("airgap", "none")
+	require.NoError(t, SaveConfig(cfg))
+
+	cmd := newTestShellCmd()
+	require.NoError(t, cmd.Flags().Set("image", "airgap"))
+	_, _, err := cachedNoPublicEgressExpectation(cmd)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rebuild")
+}
+
+func TestCachedNoPublicEgressExpectation_UnknownARNIsUnannotated(t *testing.T) {
+	t.Setenv("WHIM_CONFIG_DIR", t.TempDir())
+	cmd := newTestShellCmd()
+	require.NoError(t, cmd.Flags().Set("image", "arn:aws:lambda:us-east-1:123456789012:microvm-image:unknown"))
+	_, ok, err := cachedNoPublicEgressExpectation(cmd)
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
+func TestCachedNoPublicEgressExpectation_IncludesRecordedTopology(t *testing.T) {
+	t.Setenv("WHIM_CONFIG_DIR", t.TempDir())
+	cfg := &Config{}
+	cfg.SetImage("airgap", "arn:airgap")
+	cfg.SetEgress("airgap", "none")
+	cfg.SetEgressConnector("airgap", "arn:connector")
+	cfg.SetEgressResourceGroup("airgap", EgressResourceGroup{
+		VPCID:            "vpc-1",
+		SubnetIDs:        []string{"subnet-1"},
+		RouteTableIDs:    []string{"rtb-1"},
+		SecurityGroupIDs: []string{"sg-1"},
+		ConnectorARN:     "arn:connector",
+		ResourceGroup:    "rg-1",
+	})
+	require.NoError(t, SaveConfig(cfg))
+
+	cmd := newTestShellCmd()
+	require.NoError(t, cmd.Flags().Set("image", "airgap"))
+	got, ok, err := cachedNoPublicEgressExpectation(cmd)
+
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "vpc-1", got.VPCID)
+	assert.Equal(t, []string{"rtb-1"}, got.RouteTableIDs)
+	assert.Equal(t, "rg-1", got.ResourceGroup)
 }
 
 func TestResolveShellImageARN_NoDefaultErrors(t *testing.T) {

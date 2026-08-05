@@ -241,6 +241,11 @@ func runRun(cmd *cobra.Command, args []string) error {
 	if policy != nil {
 		launchOpts = append(launchOpts, microvm.WithIdlePolicy(*policy))
 	}
+	if expected, ok, eerr := cachedNoPublicEgressExpectation(cmd); eerr != nil {
+		return whimFail(cmd, "resolve image egress", eerr)
+	} else if ok {
+		launchOpts = append(launchOpts, microvm.WithExpectedNoPublicEgress(*expected))
+	}
 
 	launchCtx, cancelLaunch := context.WithTimeout(ctx, shellLaunchTimeout)
 	defer cancelLaunch()

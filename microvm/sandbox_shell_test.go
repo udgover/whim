@@ -115,11 +115,15 @@ func echoOnceServer() *httptest.Server {
 // given fake ws server, and mints a shell token.
 func shellMock(endpoint string) *awsapi.Mock {
 	m := &awsapi.Mock{}
+	setImageEgress(m, publicEgressConnectors())
 	m.RunMicrovmFn = func(_ context.Context, _ *awsapi.RunMicrovmInput) (*awsapi.RunMicrovmOutput, error) {
 		return &awsapi.RunMicrovmOutput{MicrovmID: "mvm-sh", Endpoint: endpoint, State: "RUNNING"}, nil
 	}
 	m.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
-		return &awsapi.GetMicrovmOutput{MicrovmID: "mvm-sh", Endpoint: endpoint, State: "RUNNING"}, nil
+		return &awsapi.GetMicrovmOutput{
+			MicrovmID: "mvm-sh", Endpoint: endpoint, State: "RUNNING",
+			EgressNetworkConnectors: publicEgressConnectors(),
+		}, nil
 	}
 	m.CreateShellAuthTokenFn = func(_ context.Context, in *awsapi.CreateShellAuthTokenInput) (*awsapi.CreateShellAuthTokenOutput, error) {
 		_ = in

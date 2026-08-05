@@ -45,6 +45,14 @@ func sourceOpts() BuildFromSourceOptions {
 	}
 }
 
+func setBuildSourcePublicVersion(mock *awsapi.Mock) {
+	mock.GetMicrovmImageVersionFn = func(_ context.Context, _ *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
+		return &awsapi.GetMicrovmImageVersionOutput{
+			EgressConnectors: []string{publicEgressConnectorARN("us-east-1")},
+		}, nil
+	}
+}
+
 func notFound() error { return awsapi.ErrNotFound }
 
 func TestBuildFromSourceRejectsInvalidOptions(t *testing.T) {
@@ -73,6 +81,7 @@ func TestBuildFromSourceReusesExistingWithoutStaging(t *testing.T) {
 	mock.GetMicrovmImageFn = func(_ context.Context, _ *awsapi.GetMicrovmImageInput) (*awsapi.GetMicrovmImageOutput, error) {
 		return &awsapi.GetMicrovmImageOutput{ImageARN: arn, State: "CREATED", LatestActiveImageVersion: "3"}, nil
 	}
+	setBuildSourcePublicVersion(mock)
 	fake := &fakeArtifactStore{}
 	m := buildManager(mock, fake)
 
@@ -96,6 +105,7 @@ func TestBuildFromSourceInProgressPollsWithoutStaging(t *testing.T) {
 		}
 		return &awsapi.GetMicrovmImageOutput{ImageARN: arn, State: state}, nil
 	}
+	setBuildSourcePublicVersion(mock)
 	fake := &fakeArtifactStore{}
 	m := buildManager(mock, fake)
 
@@ -205,12 +215,19 @@ func TestBuildFromSourceValidation(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "valid", mutate: func(*BuildFromSourceOptions) {}, wantErr: false},
-		{name: "valid egress none", mutate: func(o *BuildFromSourceOptions) { o.Egress = EgressNone }, wantErr: false},
+		{name: "public with connector rejected", mutate: func(o *BuildFromSourceOptions) {
+			o.EgressConnectorARN = "arn:connector"
+		}, wantErr: true},
+		{name: "egress none without connector rejected", mutate: func(o *BuildFromSourceOptions) { o.Egress = EgressNone }, wantErr: true},
+		{name: "valid egress none with connector", mutate: func(o *BuildFromSourceOptions) {
+			o.Egress = EgressNone
+			o.EgressConnectorARN = "arn:connector"
+		}, wantErr: false},
 		{name: "missing name", mutate: func(o *BuildFromSourceOptions) { o.Name = "" }, wantErr: true},
 		{name: "missing artifact bucket", mutate: func(o *BuildFromSourceOptions) { o.ArtifactBucket = "" }, wantErr: true},
 		{name: "missing base image arn", mutate: func(o *BuildFromSourceOptions) { o.BaseImageARN = "" }, wantErr: true},
 		{name: "missing build role arn", mutate: func(o *BuildFromSourceOptions) { o.BuildRoleARN = "" }, wantErr: true},
-		{name: "egress vpc rejected", mutate: func(o *BuildFromSourceOptions) { o.Egress = EgressVPC }, wantErr: true},
+		{name: "egress vpc without connector rejected", mutate: func(o *BuildFromSourceOptions) { o.Egress = EgressVPC }, wantErr: true},
 		{name: "unknown egress rejected", mutate: func(o *BuildFromSourceOptions) { o.Egress = EgressMode(99) }, wantErr: true},
 		{name: "capability all accepted", mutate: func(o *BuildFromSourceOptions) { o.Capabilities = []Capability{CapabilityAll} }, wantErr: false},
 		{name: "unsupported capability rejected", mutate: func(o *BuildFromSourceOptions) { o.Capabilities = []Capability{"BOGUS"} }, wantErr: true},

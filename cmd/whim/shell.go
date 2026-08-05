@@ -104,10 +104,16 @@ func runShell(cmd *cobra.Command, _ []string) error {
 	// Bound provisioning so a stuck VM fails fast instead of polling to the TTL.
 	launchCtx, cancelLaunch := context.WithTimeout(ctx, shellLaunchTimeout)
 	defer cancelLaunch()
+	launchOpts := []microvm.LaunchOption{microvm.WithTTL(ttl)}
+	if expected, ok, eerr := cachedNoPublicEgressExpectation(cmd); eerr != nil {
+		return eerr
+	} else if ok {
+		launchOpts = append(launchOpts, microvm.WithExpectedNoPublicEgress(*expected))
+	}
 	// Status goes to stderr so stdout carries only the raw pty stream.
 	printErr(cmd, "Launching MicroVM…\n")
 	start := time.Now()
-	sb, err := mgr.Launch(launchCtx, imageARN, microvm.WithTTL(ttl))
+	sb, err := mgr.Launch(launchCtx, imageARN, launchOpts...)
 	if err != nil {
 		return fmt.Errorf("launch: %w", err)
 	}
@@ -145,6 +151,13 @@ func resolveShellImageARN(ctx context.Context, cmd *cobra.Command, cfg aws.Confi
 	if strings.HasPrefix(image, "arn:") {
 		return image, nil
 	}
+	wcfg, err := LoadConfig()
+	if err != nil {
+		return "", fmt.Errorf("load whim config: %w", err)
+	}
+	if arn, ok := wcfg.Image(image); ok && arn != "" {
+		return arn, nil
+	}
 	// A bare name needs the account ID to build the full ARN.
 	id, err := sts.NewFromConfig(cfg).GetCallerIdentity(ctx, nil)
 	if err != nil {
@@ -153,6 +166,60 @@ func resolveShellImageARN(ctx context.Context, cmd *cobra.Command, cfg aws.Confi
 	// Format directly (matches Manager.ImageARN) rather than spin up a throwaway
 	// Manager just to build a string.
 	return fmt.Sprintf("arn:aws:lambda:%s:%s:microvm-image:%s", cfg.Region, aws.ToString(id.Account), image), nil
+}
+
+func cachedNoPublicEgressExpectation(cmd *cobra.Command) (*microvm.NoPublicEgressResources, bool, error) {
+	image, _ := cmd.Flags().GetString("image")
+	if image == "" {
+		return nil, false, nil
+	}
+	wcfg, err := LoadConfig()
+	if err != nil {
+		return nil, false, fmt.Errorf("load whim config: %w", err)
+	}
+	if strings.HasPrefix(image, "arn:") {
+		var found bool
+		for name, arn := range wcfg.Images {
+			if arn == image {
+				image = name
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, false, nil
+		}
+	}
+	egress, ok := wcfg.Egress(image)
+	if !ok || egress == "" {
+		return nil, false, nil
+	}
+	mode, err := parseEgress(egress)
+	if err != nil {
+		return nil, false, fmt.Errorf("cached egress for image %q: %w", image, err)
+	}
+	if mode != microvm.EgressNone {
+		return nil, false, nil
+	}
+	connector, _ := wcfg.EgressConnector(image)
+	if connector == "" {
+		return nil, false, fmt.Errorf("cached image %q was built with --egress none before Whim recorded connector ARNs; rebuild it with --force", image)
+	}
+	expected := &microvm.NoPublicEgressResources{ConnectorARN: connector}
+	if rg, found := wcfg.EgressResourceGroup(image); found {
+		if rg.ConnectorARN != "" && rg.ConnectorARN != connector {
+			return nil, false, fmt.Errorf("cached image %q has connector %q but recorded topology belongs to %q", image, connector, rg.ConnectorARN)
+		}
+		expected.VPCID = rg.VPCID
+		expected.SubnetIDs = append([]string(nil), rg.SubnetIDs...)
+		expected.RouteTableID = rg.RouteTableID
+		expected.RouteTableIDs = append([]string(nil), rg.RouteTableIDs...)
+		expected.SecurityGroupID = rg.SecurityGroupID
+		expected.SecurityGroupIDs = append([]string(nil), rg.SecurityGroupIDs...)
+		expected.NetworkACLID = rg.NetworkACLID
+		expected.ResourceGroup = rg.ResourceGroup
+	}
+	return expected, true, nil
 }
 
 // runInteractiveShell puts the terminal in raw mode, wires SIGWINCH → resize,
