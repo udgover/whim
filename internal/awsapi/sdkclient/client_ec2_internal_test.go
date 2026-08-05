@@ -1,9 +1,11 @@
 package sdkclient
 
 import (
+	"context"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -216,6 +218,40 @@ func TestRouteTableFilters(t *testing.T) {
 	}, got)
 
 	assert.Empty(t, routeTableFilters("", ""))
+}
+
+func TestDescribeAllRouteTablesFollowsPagination(t *testing.T) {
+	var calls int
+	fetch := func(_ context.Context, in *ec2.DescribeRouteTablesInput) (*ec2.DescribeRouteTablesOutput, error) {
+		calls++
+		assert.Equal(t, routeTableFilters("vpc-1", ""), in.Filters)
+		switch calls {
+		case 1:
+			assert.Nil(t, in.NextToken)
+			return &ec2.DescribeRouteTablesOutput{
+				RouteTables: []ec2types.RouteTable{{RouteTableId: aws.String("rtb-main")}},
+				NextToken:   aws.String("page-2"),
+			}, nil
+		case 2:
+			assert.Equal(t, "page-2", aws.ToString(in.NextToken))
+			return &ec2.DescribeRouteTablesOutput{
+				RouteTables: []ec2types.RouteTable{{RouteTableId: aws.String("rtb-explicit")}},
+			}, nil
+		default:
+			t.Fatalf("unexpected page request %d", calls)
+			return nil, nil
+		}
+	}
+
+	got, err := describeAllRouteTables(context.Background(), &ec2.DescribeRouteTablesInput{
+		Filters: routeTableFilters("vpc-1", ""),
+	}, fetch)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls)
+	require.Len(t, got, 2)
+	assert.Equal(t, "rtb-main", aws.ToString(got[0].RouteTableId))
+	assert.Equal(t, "rtb-explicit", aws.ToString(got[1].RouteTableId))
 }
 
 func TestNetworkACLFilters(t *testing.T) {

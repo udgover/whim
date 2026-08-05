@@ -23,6 +23,11 @@ import (
 // TestIntegration_OpenShellPreventsIdleSuspend).
 const ShellTokenLifetime = 30 * time.Minute
 
+// failedLaunchCleanupTimeout bounds detached cleanup after RunMicrovm has
+// accepted a launch but runtime state or egress metadata cannot be verified.
+// Cleanup must outlive the launch context, which is commonly the failure cause.
+const failedLaunchCleanupTimeout = 30 * time.Second
+
 // shellTokenExpiryMinutes is ShellTokenLifetime expressed for the mint API.
 const shellTokenExpiryMinutes = int32(ShellTokenLifetime / time.Minute)
 
@@ -361,12 +366,8 @@ func (m *Manager) Launch(ctx context.Context, imageARN string, opts ...LaunchOpt
 		}
 		switch g.State {
 		case "RUNNING":
-			if !sameStringSet(g.EgressNetworkConnectors, egress) {
-				mismatch := fmt.Errorf("%w: microvm %q reports egress connectors %v, expected %v", ErrEgressMismatch, sb.id, g.EgressNetworkConnectors, egress)
-				if terr := m.Terminate(ctx, sb.id); terr != nil {
-					return false, fmt.Errorf("%w; terminate unexpected microvm: %v", mismatch, terr)
-				}
-				return false, mismatch
+			if len(g.EgressNetworkConnectors) != len(egress) || !sameStringSet(g.EgressNetworkConnectors, egress) {
+				return false, fmt.Errorf("%w: microvm %q reports egress connectors %v, expected %v", ErrEgressMismatch, sb.id, g.EgressNetworkConnectors, egress)
 			}
 			if g.Endpoint != "" {
 				sb.endpoint = g.Endpoint
@@ -379,6 +380,11 @@ func (m *Manager) Launch(ctx context.Context, imageARN string, opts ...LaunchOpt
 			return false, nil
 		}
 	}); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), failedLaunchCleanupTimeout)
+		defer cancel()
+		if cleanupErr := m.Terminate(cleanupCtx, sb.id); cleanupErr != nil {
+			return nil, fmt.Errorf("%w; terminate unverified microvm: %v", err, cleanupErr)
+		}
 		return nil, err
 	}
 	return sb, nil

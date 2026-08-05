@@ -172,6 +172,21 @@ func TestEnsureImage_ReusesIgnoringDuplicateCapabilities(t *testing.T) {
 	assert.Empty(t, mock.CreateMicrovmImageCalls)
 }
 
+func TestEnsureImage_RejectsDuplicateNoPublicEgressConnectors(t *testing.T) {
+	mock := createdImageWithCaps(t, nil)
+	const connector = "arn:aws:lambda:us-east-1:123456789012:network-connector:whim-no-egress"
+	mock.GetMicrovmImageVersionFn = func(_ context.Context, _ *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
+		return &awsapi.GetMicrovmImageVersionOutput{EgressConnectors: []string{connector, connector}}, nil
+	}
+	spec := testSpec()
+	spec.Egress = microvm.EgressNone
+	spec.EgressConnectorARN = connector
+
+	_, err := newTestManager(mock).EnsureImage(context.Background(), spec)
+
+	require.ErrorIs(t, err, microvm.ErrEgressMismatch)
+}
+
 // deleteRefusingMock fails the test if any delete is attempted, proving
 // validation runs before the destructive step.
 func deleteRefusingMock(t *testing.T) *awsapi.Mock {

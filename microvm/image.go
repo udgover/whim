@@ -215,7 +215,7 @@ func (m *Manager) checkReuseImage(ctx context.Context, arn, name string, wantSpe
 	if err != nil {
 		return err
 	}
-	if !sameStringSet(ver.EgressConnectors, wantEgress) {
+	if len(ver.EgressConnectors) != len(wantEgress) || !sameStringSet(ver.EgressConnectors, wantEgress) {
 		return fmt.Errorf("%w: existing image %q has egress connectors %v but %v was requested; rebuild with --force",
 			ErrEgressMismatch, name, ver.EgressConnectors, wantEgress)
 	}

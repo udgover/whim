@@ -149,10 +149,9 @@ func egressConnectorFlagsChanged(cmd *cobra.Command) bool {
 //     group, connector) — see microvm.EnsureNoPublicEgressConnector.
 //   - --egress-subnet and --egress-security-group with --egress-connector-name
 //     explicitly set: point a caller-named connector at caller-supplied
-//     subnets/security groups directly, skipping VPC creation and
-//     Milestone 2's safety validation. An advanced escape hatch, not the
-//     safe default — it requires explicitly naming the connector so it
-//     never silently depends on the "whim-no-egress" default name.
+//     subnets/security groups directly, skipping VPC creation but retaining
+//     the same topology validation. It requires explicitly naming the connector
+//     so it never silently depends on the "whim-no-egress" default name.
 //
 // Bare "--egress none" with none of the above used to silently fall back to
 // that default connector name; that is no longer accepted.

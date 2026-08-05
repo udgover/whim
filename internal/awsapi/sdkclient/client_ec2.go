@@ -2,6 +2,7 @@ package sdkclient
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -228,17 +229,45 @@ func (c *Client) DescribeSubnets(ctx context.Context, in *awsapi.DescribeSubnets
 	return &awsapi.DescribeSubnetsOutput{Items: items}, nil
 }
 
-// DescribeRouteTables delegates to EC2 DescribeRouteTables, filtered by VPC
-// and/or by the subnet the route table is associated with.
+type describeRouteTablesFunc func(context.Context, *ec2.DescribeRouteTablesInput) (*ec2.DescribeRouteTablesOutput, error)
+
+func describeAllRouteTables(ctx context.Context, in *ec2.DescribeRouteTablesInput, fetch describeRouteTablesFunc) ([]ec2types.RouteTable, error) {
+	var tables []ec2types.RouteTable
+	var token *string
+	for {
+		pageIn := *in
+		pageIn.NextToken = token
+		out, err := fetch(ctx, &pageIn)
+		if err != nil {
+			return nil, err
+		}
+		tables = append(tables, out.RouteTables...)
+		next := aws.ToString(out.NextToken)
+		if next == "" {
+			return tables, nil
+		}
+		if next == aws.ToString(token) {
+			return nil, fmt.Errorf("EC2 DescribeRouteTables returned repeated pagination token %q", next)
+		}
+		token = aws.String(next)
+	}
+}
+
+// DescribeRouteTables delegates to EC2 DescribeRouteTables, follows every
+// page, and filters by VPC and/or by the subnet the route table is associated
+// with. Complete pagination is security-sensitive: validation must see a
+// subnet's explicit table even when EC2 returns the VPC's main table first.
 func (c *Client) DescribeRouteTables(ctx context.Context, in *awsapi.DescribeRouteTablesInput) (*awsapi.DescribeRouteTablesOutput, error) {
-	out, err := c.ec2.DescribeRouteTables(ctx, &ec2.DescribeRouteTablesInput{
+	routeTables, err := describeAllRouteTables(ctx, &ec2.DescribeRouteTablesInput{
 		Filters: routeTableFilters(in.VPCID, in.SubnetID),
+	}, func(ctx context.Context, in *ec2.DescribeRouteTablesInput) (*ec2.DescribeRouteTablesOutput, error) {
+		return c.ec2.DescribeRouteTables(ctx, in)
 	})
 	if err != nil {
 		return nil, mapEC2Err(err)
 	}
-	items := make([]awsapi.RouteTable, len(out.RouteTables))
-	for i, rt := range out.RouteTables {
+	items := make([]awsapi.RouteTable, len(routeTables))
+	for i, rt := range routeTables {
 		items[i] = mapRouteTable(rt)
 	}
 	return &awsapi.DescribeRouteTablesOutput{Items: items}, nil

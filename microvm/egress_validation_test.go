@@ -110,6 +110,35 @@ func TestValidateNoPublicEgressConnector_RejectsPublicRoute(t *testing.T) {
 	require.ErrorIs(t, err, microvm.ErrPublicRoute)
 }
 
+func TestValidateNoPublicEgressConnector_PrefersExplicitSubnetRouteTableOverMain(t *testing.T) {
+	mock := safeNoPublicEgressMock()
+	mock.DescribeRouteTablesFn = func(context.Context, *awsapi.DescribeRouteTablesInput) (*awsapi.DescribeRouteTablesOutput, error) {
+		return &awsapi.DescribeRouteTablesOutput{Items: []awsapi.RouteTable{
+			{
+				ID:           "rtb-main-safe",
+				VPCID:        "vpc-safe",
+				Associations: []awsapi.RouteTableAssociation{{Main: true}},
+				Routes:       []awsapi.Route{{DestinationCIDRBlock: testNoPublicVPCCIDR, GatewayID: "local"}},
+			},
+			{
+				ID:           "rtb-explicit-public",
+				VPCID:        "vpc-safe",
+				Associations: []awsapi.RouteTableAssociation{{SubnetID: "subnet-safe"}},
+				Routes: []awsapi.Route{
+					{DestinationCIDRBlock: testNoPublicVPCCIDR, GatewayID: "local"},
+					{DestinationCIDRBlock: "0.0.0.0/0", NatGatewayID: "nat-public"},
+				},
+			},
+		}}, nil
+	}
+
+	_, err := newTestManager(mock).ValidateNoPublicEgressConnector(
+		context.Background(), microvm.NoPublicEgressResources{ConnectorARN: testNoPublicConnector},
+	)
+
+	require.ErrorIs(t, err, microvm.ErrPublicRoute)
+}
+
 func TestEnsureNetworkConnector_ExistingConnectorMustMatchSuppliedTopology(t *testing.T) {
 	mock := safeNoPublicEgressMock()
 

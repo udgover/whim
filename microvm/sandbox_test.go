@@ -205,6 +205,24 @@ func TestLaunch_RejectsRuntimeEgressMetadataMismatchAndTerminates(t *testing.T) 
 	assert.Equal(t, "mvm-123", mock.TerminateMicrovmCalls[0].MicrovmIdentifier)
 }
 
+func TestLaunch_RejectsDuplicateRuntimeEgressMetadataAndTerminates(t *testing.T) {
+	mock := runningMock(nil)
+	wantConnector := "arn:aws:lambda:us-east-1:123456789012:network-connector:whim-no-egress"
+	setImageEgress(mock, []string{wantConnector})
+	mock.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		return &awsapi.GetMicrovmOutput{
+			MicrovmID:               "mvm-123",
+			State:                   "RUNNING",
+			EgressNetworkConnectors: []string{wantConnector, wantConnector},
+		}, nil
+	}
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN)
+
+	require.ErrorIs(t, err, microvm.ErrEgressMismatch)
+	require.Len(t, mock.TerminateMicrovmCalls, 1, "runtime metadata must contain the exact connector list, including cardinality")
+}
+
 func TestLaunch_IngressOverride(t *testing.T) {
 	var in *awsapi.RunMicrovmInput
 	mgr := newTestManager(runningMock(&in))
@@ -260,6 +278,23 @@ func TestLaunch_TerminatedDuringProvisioning_Fails(t *testing.T) {
 	require.ErrorIs(t, err, microvm.ErrVMProvisionFailed)
 }
 
+func TestLaunch_GetMicrovmFailureTerminatesUnverifiedVM(t *testing.T) {
+	mock := &awsapi.Mock{}
+	setImageEgress(mock, publicEgressConnectors())
+	mock.RunMicrovmFn = func(_ context.Context, _ *awsapi.RunMicrovmInput) (*awsapi.RunMicrovmOutput, error) {
+		return &awsapi.RunMicrovmOutput{MicrovmID: "mvm-x", State: "PENDING"}, nil
+	}
+	mock.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		return nil, errors.New("metadata unavailable")
+	}
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN)
+
+	require.ErrorContains(t, err, "metadata unavailable")
+	require.Len(t, mock.TerminateMicrovmCalls, 1, "a VM whose runtime metadata cannot be verified must be terminated")
+	assert.Equal(t, "mvm-x", mock.TerminateMicrovmCalls[0].MicrovmIdentifier)
+}
+
 func TestLaunch_ContextCanceled_AbortsPoll(t *testing.T) {
 	mock := &awsapi.Mock{}
 	setImageEgress(mock, publicEgressConnectors())
@@ -268,6 +303,10 @@ func TestLaunch_ContextCanceled_AbortsPoll(t *testing.T) {
 	}
 	mock.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
 		return &awsapi.GetMicrovmOutput{MicrovmID: "mvm-x", State: "PENDING"}, nil // never RUNNING
+	}
+	mock.TerminateMicrovmFn = func(cleanupCtx context.Context, _ *awsapi.TerminateMicrovmInput) error {
+		assert.NoError(t, cleanupCtx.Err(), "cleanup must not reuse the expired launch context")
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -278,6 +317,7 @@ func TestLaunch_ContextCanceled_AbortsPoll(t *testing.T) {
 	_, err := mgr.Launch(ctx, testImageARN)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
+	require.Len(t, mock.TerminateMicrovmCalls, 1, "a timed-out launch must terminate its unverified VM")
 }
 
 func TestAttach_RunningReturnsSandbox(t *testing.T) {
