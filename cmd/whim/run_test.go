@@ -263,7 +263,7 @@ func TestRunDetach_RecordsRunMicrovmAndNeverTerminates(t *testing.T) {
 	assert.Equal(t, "mvm-detached\n", out.String(), "run -d prints just the bare id, no timestamp, so it's scriptable")
 }
 
-func TestRunDetach_CachedEgressNoneValidatesAndUsesBakedConnector(t *testing.T) {
+func TestRunDetach_CachedEgressNoneValidatesAndOverridesPublicBuildConnector(t *testing.T) {
 	t.Setenv("WHIM_CONFIG_DIR", t.TempDir())
 	const connector = "arn:aws:lambda:us-east-1:123456789012:network-connector:whim-no-egress"
 	cfgFile := &Config{}
@@ -290,7 +290,9 @@ func TestRunDetach_CachedEgressNoneValidatesAndUsesBakedConnector(t *testing.T) 
 		return &awsapi.GetMicrovmImageOutput{ImageARN: in.ImageIdentifier, State: "CREATED", LatestActiveImageVersion: "1"}, nil
 	}
 	mock.GetMicrovmImageVersionFn = func(context.Context, *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
-		return &awsapi.GetMicrovmImageVersionOutput{EgressConnectors: []string{connector}}, nil
+		return &awsapi.GetMicrovmImageVersionOutput{
+			EgressConnectors: []string{"arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"},
+		}, nil
 	}
 	mock.GetNetworkConnectorFn = func(context.Context, *awsapi.GetNetworkConnectorInput) (*awsapi.GetNetworkConnectorOutput, error) {
 		return &awsapi.GetNetworkConnectorOutput{
@@ -318,8 +320,8 @@ func TestRunDetach_CachedEgressNoneValidatesAndUsesBakedConnector(t *testing.T) 
 	require.Len(t, mock.RunMicrovmCalls, 1)
 	assert.Equal(t, []string{connector}, mock.RunMicrovmCalls[0].EgressNetworkConnectors,
 		"cached --egress none must launch with the recorded connector")
-	assert.NotEmpty(t, mock.GetMicrovmImageVersionCalls,
-		"the image's baked connector remains the launch source of truth")
+	assert.Empty(t, mock.GetMicrovmImageVersionCalls,
+		"the explicit runtime policy must not inherit the image's public build connector")
 }
 
 func TestExecCmd_InteractiveFlagsPresent(t *testing.T) {

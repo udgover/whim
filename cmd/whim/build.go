@@ -121,6 +121,16 @@ func parseEgress(s string) (microvm.EgressMode, error) {
 	}
 }
 
+// buildImageNetworkSettings separates the image build's network access from
+// the requested runtime policy. Container-backed image creation needs public
+// egress to pull its base image; --egress none is enforced when the VM starts.
+func buildImageNetworkSettings(runtimeEgress microvm.EgressMode, runtimeConnectorARN string) (microvm.EgressMode, string) {
+	if runtimeEgress == microvm.EgressNone {
+		return microvm.EgressPublic, ""
+	}
+	return runtimeEgress, runtimeConnectorARN
+}
+
 func egressConnectorFlagsChanged(cmd *cobra.Command) bool {
 	for _, name := range []string{
 		"egress-connector", "egress-connector-name", "egress-subnet", "egress-security-group", "egress-operator-role",
@@ -355,13 +365,14 @@ func runBuild(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve egress connector: %w", err)
 	}
+	buildEgress, buildEgressConnectorARN := buildImageNetworkSettings(egress, egressConnectorARN)
 	opts := microvm.BuildFromSourceOptions{
 		Name:               name,
 		ArtifactBucket:     env.bucket,
 		BaseImageARN:       env.baseImageARN,
 		BuildRoleARN:       env.buildRoleARN,
-		Egress:             egress,
-		EgressConnectorARN: egressConnectorARN,
+		Egress:             buildEgress,
+		EgressConnectorARN: buildEgressConnectorARN,
 		Force:              force,
 		ContextSubdir:      contextSubdir,
 		HTTPSHeaders:       httpsHeaders,

@@ -108,7 +108,10 @@ func runShell(cmd *cobra.Command, _ []string) error {
 	if expected, ok, eerr := cachedNoPublicEgressExpectation(cmd); eerr != nil {
 		return eerr
 	} else if ok {
-		launchOpts = append(launchOpts, microvm.WithExpectedNoPublicEgress(*expected))
+		launchOpts = append(launchOpts,
+			microvm.WithEgressConnector(microvm.EgressNone, expected.ConnectorARN),
+			microvm.WithExpectedNoPublicEgress(*expected),
+		)
 	}
 	// Status goes to stderr so stdout carries only the raw pty stream.
 	printErr(cmd, "Launching MicroVM…\n")

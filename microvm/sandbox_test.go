@@ -177,6 +177,43 @@ func TestLaunch_ExpectedNoPublicEgressRejectsBakedConnectorMismatch(t *testing.T
 	assert.Empty(t, mock.RunMicrovmCalls)
 }
 
+func TestLaunch_ExpectedNoPublicEgressValidatesMatchingRuntimeOverride(t *testing.T) {
+	var input *awsapi.RunMicrovmInput
+	mock := runningMock(&input)
+	configureSafeNoPublicEgressMock(mock)
+	expected := microvm.NoPublicEgressResources{
+		ConnectorARN:     testNoPublicConnector,
+		VPCID:            "vpc-safe",
+		SubnetIDs:        []string{"subnet-safe"},
+		RouteTableIDs:    []string{"rtb-safe"},
+		SecurityGroupIDs: []string{"sg-safe"},
+	}
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN,
+		microvm.WithEgressConnector(microvm.EgressNone, testNoPublicConnector),
+		microvm.WithExpectedNoPublicEgress(expected))
+
+	require.NoError(t, err)
+	require.NotNil(t, input)
+	assert.Equal(t, []string{testNoPublicConnector}, input.EgressNetworkConnectors)
+	assert.Empty(t, mock.GetMicrovmImageVersionCalls,
+		"an explicit runtime connector must not depend on the image's public build connector")
+}
+
+func TestLaunch_ExpectedNoPublicEgressRejectsMismatchedRuntimeOverride(t *testing.T) {
+	mock := runningMock(nil)
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN,
+		microvm.WithEgressConnector(microvm.EgressNone,
+			"arn:aws:lambda:us-east-1:123456789012:network-connector:other"),
+		microvm.WithExpectedNoPublicEgress(microvm.NoPublicEgressResources{
+			ConnectorARN: testNoPublicConnector,
+		}))
+
+	require.ErrorIs(t, err, microvm.ErrEgressMismatch)
+	assert.Empty(t, mock.RunMicrovmCalls)
+}
+
 func TestLaunch_RejectsImageWithEmptyEgressBeforeRun(t *testing.T) {
 	mock := runningMockWithImageEgress(nil, nil)
 

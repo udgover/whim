@@ -56,9 +56,8 @@ type LaunchConfig struct {
 	Egress             EgressMode
 	EgressConnectorARN string
 	EgressExplicit     bool
-	// ExpectedNoPublicEgress validates the connector baked into image metadata
-	// without replacing it. This lets callers fail closed on topology drift while
-	// preserving the image-version connector as the launch source of truth.
+	// ExpectedNoPublicEgress validates the resolved launch connector and the
+	// caller-recorded backing topology immediately before launch.
 	ExpectedNoPublicEgress *NoPublicEgressResources
 	// IngressOverride, when non-empty, replaces the default SHELL_INGRESS
 	// connector; the default (empty) is resolved to a region-specific
@@ -159,10 +158,12 @@ func WithEgressConnector(mode EgressMode, connectorARN string) LaunchOption {
 	}
 }
 
-// WithExpectedNoPublicEgress requires the image's baked connector to match
+// WithExpectedNoPublicEgress requires the resolved launch connector to match
 // resources.ConnectorARN, then revalidates its live VPC topology before launch.
-// It does not override image metadata. Populate the other resource fields to
-// detect identifier drift as well as unsafe route/security-group changes.
+// Used alone it validates the connector inherited from image metadata. Pair it
+// with a matching WithEgressConnector(EgressNone, ...) to validate an explicit
+// runtime override. Populate the other resource fields to detect identifier
+// drift as well as unsafe route/security-group changes.
 func WithExpectedNoPublicEgress(resources NoPublicEgressResources) LaunchOption {
 	return func(cfg *LaunchConfig) error {
 		resources.ConnectorARN = strings.TrimSpace(resources.ConnectorARN)

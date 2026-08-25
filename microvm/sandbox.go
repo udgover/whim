@@ -322,17 +322,17 @@ func (m *Manager) Launch(ctx context.Context, imageARN string, opts ...LaunchOpt
 		}
 	}
 	if cfg.ExpectedNoPublicEgress != nil {
-		if cfg.EgressExplicit {
-			return nil, fmt.Errorf("%w: expected no-public-egress validation cannot be combined with an egress override", ErrInvalidOption)
+		if cfg.EgressExplicit && cfg.Egress != EgressNone {
+			return nil, fmt.Errorf("%w: expected no-public-egress validation requires an EgressNone override", ErrInvalidOption)
 		}
 		if len(egress) != 1 || egress[0] != cfg.ExpectedNoPublicEgress.ConnectorARN {
-			return nil, fmt.Errorf("%w: image reports egress connectors %v, expected exactly [%s]", ErrEgressMismatch, egress, cfg.ExpectedNoPublicEgress.ConnectorARN)
+			return nil, fmt.Errorf("%w: launch resolved egress connectors %v, expected exactly [%s]", ErrEgressMismatch, egress, cfg.ExpectedNoPublicEgress.ConnectorARN)
 		}
 		if _, err := m.ValidateNoPublicEgressConnector(ctx, *cfg.ExpectedNoPublicEgress); err != nil {
 			return nil, fmt.Errorf("validate recorded no-public-egress resources before launch: %w", err)
 		}
 	}
-	if cfg.EgressExplicit && cfg.Egress == EgressNone {
+	if cfg.EgressExplicit && cfg.Egress == EgressNone && cfg.ExpectedNoPublicEgress == nil {
 		if _, err := m.ValidateNoPublicEgressConnector(ctx, NoPublicEgressResources{ConnectorARN: cfg.EgressConnectorARN}); err != nil {
 			return nil, fmt.Errorf("validate no-public-egress connector before launch: %w", err)
 		}

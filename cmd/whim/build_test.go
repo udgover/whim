@@ -70,6 +70,13 @@ func TestBuildEgress_Mapping(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestBuildImageNetworkSettings_RuntimeNoneBuildsWithPublicEgress(t *testing.T) {
+	buildEgress, buildConnector := buildImageNetworkSettings(microvm.EgressNone, "arn:isolated")
+
+	assert.Equal(t, microvm.EgressPublic, buildEgress)
+	assert.Empty(t, buildConnector, "the isolated connector is a runtime policy, not an image-build connector")
+}
+
 func newTestBuildCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "build"}
 	addBuildFlags(cmd)
