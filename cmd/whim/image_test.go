@@ -19,6 +19,8 @@ func TestClearCacheIfMatches_PreservesCustomImages(t *testing.T) {
 	t.Setenv("WHIM_CONFIG_DIR", dir)
 	cfg := &Config{ImageARN: "arn:default"}
 	cfg.SetImage("api", "arn:api")
+	cfg.SetEgress("api", "none")
+	cfg.SetEgressConnector("api", "arn:connector")
 	require.NoError(t, SaveConfig(cfg))
 
 	cmd := &cobra.Command{}
@@ -32,6 +34,12 @@ func TestClearCacheIfMatches_PreservesCustomImages(t *testing.T) {
 	got, ok := loaded.Image("api")
 	assert.True(t, ok, "custom images must survive default-image cache clearing")
 	assert.Equal(t, "arn:api", got)
+	egress, ok := loaded.Egress("api")
+	assert.True(t, ok)
+	assert.Equal(t, "none", egress)
+	connector, ok := loaded.EgressConnector("api")
+	assert.True(t, ok)
+	assert.Equal(t, "arn:connector", connector)
 }
 
 func TestClearCacheIfMatches_PrunesDeletedCustomImage(t *testing.T) {
@@ -39,6 +47,9 @@ func TestClearCacheIfMatches_PrunesDeletedCustomImage(t *testing.T) {
 	cfg := &Config{ImageARN: "arn:default"}
 	cfg.SetImage("api", "arn:api")
 	cfg.SetImage("web", "arn:web")
+	cfg.SetEgress("api", "none")
+	cfg.SetEgress("web", "public")
+	cfg.SetEgressConnector("api", "arn:connector")
 	require.NoError(t, SaveConfig(cfg))
 
 	cmd := &cobra.Command{}
@@ -50,9 +61,16 @@ func TestClearCacheIfMatches_PrunesDeletedCustomImage(t *testing.T) {
 	require.NoError(t, err)
 	_, ok := loaded.Image("api")
 	assert.False(t, ok, "the deleted custom image's entry must be pruned from the cache")
+	_, ok = loaded.Egress("api")
+	assert.False(t, ok, "the deleted custom image's egress entry must be pruned from the cache")
+	_, ok = loaded.EgressConnector("api")
+	assert.False(t, ok, "the deleted custom image's egress connector entry must be pruned from the cache")
 	got, ok := loaded.Image("web")
 	assert.True(t, ok, "unrelated custom images must survive")
 	assert.Equal(t, "arn:web", got)
+	egress, ok := loaded.Egress("web")
+	assert.True(t, ok, "unrelated custom image egress must survive")
+	assert.Equal(t, "public", egress)
 	assert.Equal(t, "arn:default", loaded.ImageARN, "the default ARN is untouched when a custom image is removed")
 }
 

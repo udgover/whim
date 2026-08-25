@@ -15,6 +15,36 @@ type Config struct {
 	// built ARN. It is additive: older configs with only image_arn load fine,
 	// and the default image continues to live in ImageARN.
 	Images map[string]string `json:"images,omitempty"`
+	// ImageEgress records the requested runtime egress mode for custom images.
+	// It is separate from Images so older configs remain readable.
+	ImageEgress map[string]string `json:"image_egress,omitempty"`
+	// ImageEgressConnectors records the exact runtime egress connector ARN used
+	// for custom images with connector-backed egress.
+	ImageEgressConnectors map[string]string `json:"image_egress_connectors,omitempty"`
+	// ImageEgressResourceGroups records the validated no-public-egress topology
+	// (VPC, subnet, route table, security group) revalidated before launch. For
+	// --egress-auto-provision it also records the stable resource-group tag for
+	// future cleanup tooling. Whim never deletes the named AWS resources based
+	// on this map, only the local cache entry.
+	ImageEgressResourceGroups map[string]EgressResourceGroup `json:"image_egress_resource_groups,omitempty"`
+}
+
+// EgressResourceGroup is the persisted shape of a validated no-public-egress
+// topology. It mirrors microvm.NoPublicEgressResources without
+// depending on the microvm package here, keeping config.go's schema stable
+// across internal library refactors.
+type EgressResourceGroup struct {
+	VPCID            string   `json:"vpc_id,omitempty"`
+	SubnetIDs        []string `json:"subnet_ids,omitempty"`
+	RouteTableID     string   `json:"route_table_id,omitempty"`
+	RouteTableIDs    []string `json:"route_table_ids,omitempty"`
+	SecurityGroupID  string   `json:"security_group_id,omitempty"`
+	SecurityGroupIDs []string `json:"security_group_ids,omitempty"`
+	NetworkACLID     string   `json:"network_acl_id,omitempty"`
+	ConnectorARN     string   `json:"connector_arn,omitempty"`
+	// ResourceGroup is the stable WhimResourceGroup tag value for auto-provisioned
+	// resources. It is empty for caller-managed topologies.
+	ResourceGroup string `json:"resource_group,omitempty"`
 }
 
 // Image returns the cached ARN for a custom image name, and whether it exists.
@@ -32,14 +62,79 @@ func (c *Config) SetImage(name, arn string) {
 	c.Images[name] = arn
 }
 
+// Egress returns the cached runtime egress mode for a custom image name.
+func (c *Config) Egress(name string) (string, bool) {
+	egress, ok := c.ImageEgress[name]
+	return egress, ok
+}
+
+// SetEgress records the requested runtime egress mode for a custom image name.
+func (c *Config) SetEgress(name, egress string) {
+	if c.ImageEgress == nil {
+		c.ImageEgress = make(map[string]string)
+	}
+	c.ImageEgress[name] = egress
+}
+
+// EgressConnector returns the cached runtime egress connector ARN for a custom image.
+func (c *Config) EgressConnector(name string) (string, bool) {
+	connector, ok := c.ImageEgressConnectors[name]
+	return connector, ok
+}
+
+// SetEgressConnector records the connector ARN used to launch a custom image.
+func (c *Config) SetEgressConnector(name, connectorARN string) {
+	if connectorARN == "" {
+		if c.ImageEgressConnectors != nil {
+			delete(c.ImageEgressConnectors, name)
+		}
+		return
+	}
+	if c.ImageEgressConnectors == nil {
+		c.ImageEgressConnectors = make(map[string]string)
+	}
+	c.ImageEgressConnectors[name] = connectorARN
+}
+
+// EgressResourceGroup returns the cached no-public-egress resource group for
+// a custom image name, and whether one is recorded.
+func (c *Config) EgressResourceGroup(name string) (EgressResourceGroup, bool) {
+	rg, ok := c.ImageEgressResourceGroups[name]
+	return rg, ok
+}
+
+// SetEgressResourceGroup records the validated no-public-egress topology used
+// to launch a custom image. Passing the zero value clears any
+// existing entry, matching SetEgressConnector's empty-string-clears
+// convention. ConnectorARN is required for every managed or caller-supplied
+// topology, so its absence is the clear signal.
+func (c *Config) SetEgressResourceGroup(name string, rg EgressResourceGroup) {
+	if rg.ConnectorARN == "" {
+		if c.ImageEgressResourceGroups != nil {
+			delete(c.ImageEgressResourceGroups, name)
+		}
+		return
+	}
+	if c.ImageEgressResourceGroups == nil {
+		c.ImageEgressResourceGroups = make(map[string]EgressResourceGroup)
+	}
+	c.ImageEgressResourceGroups[name] = rg
+}
+
 // removeImageByARN deletes any custom image entries whose cached ARN equals
 // arn, returning whether anything was removed. Used to prune the cache after a
-// successful `whim image rm` so a deleted image is not left dangling.
+// successful `whim image rm` so a deleted image is not left dangling. This
+// only ever edits the local config map: it never calls AWS, so it never
+// deletes the AWS networking resources an auto-provisioned resource group
+// named — that's a deliberately separate, explicit command (Milestone 6).
 func (c *Config) removeImageByARN(arn string) bool {
 	removed := false
 	for name, a := range c.Images {
 		if a == arn {
 			delete(c.Images, name)
+			delete(c.ImageEgress, name)
+			delete(c.ImageEgressConnectors, name)
+			delete(c.ImageEgressResourceGroups, name)
 			removed = true
 		}
 	}

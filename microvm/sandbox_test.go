@@ -14,20 +14,47 @@ import (
 
 const testImageARN = "arn:aws:lambda:us-east-1:123456789012:microvm-image:whim-default"
 
-// runningMock returns a mock whose RunMicrovm succeeds and GetMicrovm reports
-// RUNNING immediately, capturing the RunMicrovm input for assertions.
-func runningMock(captured **awsapi.RunMicrovmInput) *awsapi.Mock {
+func publicEgressConnectors() []string {
+	return []string{"arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"}
+}
+
+func setImageEgress(m *awsapi.Mock, imageEgress []string) {
+	m.GetMicrovmImageFn = func(_ context.Context, in *awsapi.GetMicrovmImageInput) (*awsapi.GetMicrovmImageOutput, error) {
+		return &awsapi.GetMicrovmImageOutput{ImageARN: in.ImageIdentifier, State: "CREATED", LatestActiveImageVersion: "1"}, nil
+	}
+	m.GetMicrovmImageVersionFn = func(_ context.Context, _ *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
+		return &awsapi.GetMicrovmImageVersionOutput{EgressConnectors: imageEgress}, nil
+	}
+}
+
+// runningMockWithImageEgress returns a mock whose image has the given egress
+// connectors, RunMicrovm succeeds, and GetMicrovm reports RUNNING immediately,
+// capturing the RunMicrovm input for assertions.
+func runningMockWithImageEgress(captured **awsapi.RunMicrovmInput, imageEgress []string) *awsapi.Mock {
 	m := &awsapi.Mock{}
+	var launchedEgress []string
 	m.RunMicrovmFn = func(_ context.Context, in *awsapi.RunMicrovmInput) (*awsapi.RunMicrovmOutput, error) {
 		if captured != nil {
 			*captured = in
 		}
+		launchedEgress = append([]string(nil), in.EgressNetworkConnectors...)
 		return &awsapi.RunMicrovmOutput{MicrovmID: "mvm-123", Endpoint: "mvm-123.lambda-microvm.us-east-1.on.aws", State: "PENDING"}, nil
 	}
 	m.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
-		return &awsapi.GetMicrovmOutput{MicrovmID: "mvm-123", Endpoint: "mvm-123.lambda-microvm.us-east-1.on.aws", State: "RUNNING"}, nil
+		return &awsapi.GetMicrovmOutput{
+			MicrovmID:               "mvm-123",
+			Endpoint:                "mvm-123.lambda-microvm.us-east-1.on.aws",
+			State:                   "RUNNING",
+			EgressNetworkConnectors: append([]string(nil), launchedEgress...),
+		}, nil
 	}
+	setImageEgress(m, imageEgress)
 	return m
+}
+
+// runningMock returns a mock with a public-egress image.
+func runningMock(captured **awsapi.RunMicrovmInput) *awsapi.Mock {
+	return runningMockWithImageEgress(captured, publicEgressConnectors())
 }
 
 func TestLaunch_PassesTTLIngressEgress(t *testing.T) {
@@ -49,7 +76,7 @@ func TestLaunch_PassesTTLIngressEgress(t *testing.T) {
 	require.Len(t, in.IngressNetworkConnectors, 1)
 	assert.Contains(t, in.IngressNetworkConnectors[0], "us-east-1")
 	assert.Contains(t, in.IngressNetworkConnectors[0], "SHELL_INGRESS")
-	// Default egress = public → INTERNET_EGRESS connector.
+	// Default launch egress inherits the image's public connector.
 	require.Len(t, in.EgressNetworkConnectors, 1)
 	assert.Contains(t, in.EgressNetworkConnectors[0], "INTERNET_EGRESS")
 }
@@ -76,12 +103,161 @@ func TestLaunch_RequiresImageARN(t *testing.T) {
 	assert.Empty(t, mock.RunMicrovmCalls, "must not call RunMicrovm without an image ARN")
 }
 
-func TestLaunch_EgressNone_OmitsEgressConnector(t *testing.T) {
-	var in *awsapi.RunMicrovmInput
-	mgr := newTestManager(runningMock(&in))
+func TestLaunch_EgressNone_RequiresConnector(t *testing.T) {
+	mgr := newTestManager(runningMock(nil))
 	_, err := mgr.Launch(context.Background(), testImageARN, microvm.WithEgress(microvm.EgressNone))
+	require.ErrorIs(t, err, microvm.ErrInvalidOption)
+}
+
+func TestLaunch_EgressNone_SendsConnector(t *testing.T) {
+	var in *awsapi.RunMicrovmInput
+	mock := runningMock(&in)
+	configureSafeNoPublicEgressMock(mock)
+	mgr := newTestManager(mock)
+	connector := testNoPublicConnector
+	_, err := mgr.Launch(context.Background(), testImageARN, microvm.WithEgressConnector(microvm.EgressNone, connector))
 	require.NoError(t, err)
-	assert.Empty(t, in.EgressNetworkConnectors, "EgressNone must send no egress connector")
+	assert.Equal(t, []string{connector}, in.EgressNetworkConnectors)
+}
+
+func TestLaunch_DefaultEgressInheritsImageConnector(t *testing.T) {
+	var in *awsapi.RunMicrovmInput
+	connector := "arn:aws:lambda:us-east-1:123456789012:network-connector:whim-no-egress"
+	mgr := newTestManager(runningMockWithImageEgress(&in, []string{connector}))
+	_, err := mgr.Launch(context.Background(), testImageARN)
+	require.NoError(t, err)
+	assert.Equal(t, []string{connector}, in.EgressNetworkConnectors)
+}
+
+func TestLaunch_EgressNone_RevalidatesTopologyBeforeRun(t *testing.T) {
+	mock := safeNoPublicEgressMock()
+	mock.DescribeSecurityGroupsFn = func(context.Context, *awsapi.DescribeSecurityGroupsInput) (*awsapi.DescribeSecurityGroupsOutput, error) {
+		return &awsapi.DescribeSecurityGroupsOutput{Items: []awsapi.SecurityGroup{{
+			ID: "sg-safe", VPCID: "vpc-safe",
+			EgressRules: []awsapi.SecurityGroupRule{{IPProtocol: "-1", CIDRIPv4: "0.0.0.0/0"}},
+		}}}, nil
+	}
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN,
+		microvm.WithEgressConnector(microvm.EgressNone, testNoPublicConnector))
+
+	require.ErrorIs(t, err, microvm.ErrSecurityGroupEgress)
+	assert.Empty(t, mock.RunMicrovmCalls, "drifted isolation must fail before launching")
+}
+
+func TestLaunch_ExpectedNoPublicEgressUsesBakedConnectorAndValidatesTopology(t *testing.T) {
+	var input *awsapi.RunMicrovmInput
+	mock := runningMockWithImageEgress(&input, []string{testNoPublicConnector})
+	configureSafeNoPublicEgressMock(mock)
+	expected := microvm.NoPublicEgressResources{
+		ConnectorARN:     testNoPublicConnector,
+		VPCID:            "vpc-safe",
+		SubnetIDs:        []string{"subnet-safe"},
+		RouteTableIDs:    []string{"rtb-safe"},
+		SecurityGroupIDs: []string{"sg-safe"},
+	}
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN,
+		microvm.WithExpectedNoPublicEgress(expected))
+
+	require.NoError(t, err)
+	require.NotNil(t, input)
+	assert.Equal(t, []string{testNoPublicConnector}, input.EgressNetworkConnectors)
+	assert.NotEmpty(t, mock.GetMicrovmImageVersionCalls, "launch must inherit and verify the image's baked connector")
+}
+
+func TestLaunch_ExpectedNoPublicEgressRejectsBakedConnectorMismatch(t *testing.T) {
+	mock := runningMockWithImageEgress(nil, publicEgressConnectors())
+	configureSafeNoPublicEgressMock(mock)
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN,
+		microvm.WithExpectedNoPublicEgress(microvm.NoPublicEgressResources{ConnectorARN: testNoPublicConnector}))
+
+	require.ErrorIs(t, err, microvm.ErrEgressMismatch)
+	assert.Empty(t, mock.RunMicrovmCalls)
+}
+
+func TestLaunch_ExpectedNoPublicEgressValidatesMatchingRuntimeOverride(t *testing.T) {
+	var input *awsapi.RunMicrovmInput
+	mock := runningMock(&input)
+	configureSafeNoPublicEgressMock(mock)
+	expected := microvm.NoPublicEgressResources{
+		ConnectorARN:     testNoPublicConnector,
+		VPCID:            "vpc-safe",
+		SubnetIDs:        []string{"subnet-safe"},
+		RouteTableIDs:    []string{"rtb-safe"},
+		SecurityGroupIDs: []string{"sg-safe"},
+	}
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN,
+		microvm.WithEgressConnector(microvm.EgressNone, testNoPublicConnector),
+		microvm.WithExpectedNoPublicEgress(expected))
+
+	require.NoError(t, err)
+	require.NotNil(t, input)
+	assert.Equal(t, []string{testNoPublicConnector}, input.EgressNetworkConnectors)
+	assert.Empty(t, mock.GetMicrovmImageVersionCalls,
+		"an explicit runtime connector must not depend on the image's public build connector")
+}
+
+func TestLaunch_ExpectedNoPublicEgressRejectsMismatchedRuntimeOverride(t *testing.T) {
+	mock := runningMock(nil)
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN,
+		microvm.WithEgressConnector(microvm.EgressNone,
+			"arn:aws:lambda:us-east-1:123456789012:network-connector:other"),
+		microvm.WithExpectedNoPublicEgress(microvm.NoPublicEgressResources{
+			ConnectorARN: testNoPublicConnector,
+		}))
+
+	require.ErrorIs(t, err, microvm.ErrEgressMismatch)
+	assert.Empty(t, mock.RunMicrovmCalls)
+}
+
+func TestLaunch_RejectsImageWithEmptyEgressBeforeRun(t *testing.T) {
+	mock := runningMockWithImageEgress(nil, nil)
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN)
+
+	require.ErrorIs(t, err, microvm.ErrEgressMismatch)
+	assert.Empty(t, mock.RunMicrovmCalls, "empty image metadata must never reach AWS's public-default fallback")
+}
+
+func TestLaunch_RejectsRuntimeEgressMetadataMismatchAndTerminates(t *testing.T) {
+	mock := runningMock(nil)
+	mock.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		return &awsapi.GetMicrovmOutput{
+			MicrovmID:               "mvm-123",
+			State:                   "RUNNING",
+			EgressNetworkConnectors: publicEgressConnectors(),
+		}, nil
+	}
+	wantConnector := "arn:aws:lambda:us-east-1:123456789012:network-connector:whim-no-egress"
+	setImageEgress(mock, []string{wantConnector})
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN)
+
+	require.ErrorIs(t, err, microvm.ErrEgressMismatch)
+	require.Len(t, mock.TerminateMicrovmCalls, 1, "a VM with unexpected egress metadata must be terminated")
+	assert.Equal(t, "mvm-123", mock.TerminateMicrovmCalls[0].MicrovmIdentifier)
+}
+
+func TestLaunch_RejectsDuplicateRuntimeEgressMetadataAndTerminates(t *testing.T) {
+	mock := runningMock(nil)
+	wantConnector := "arn:aws:lambda:us-east-1:123456789012:network-connector:whim-no-egress"
+	setImageEgress(mock, []string{wantConnector})
+	mock.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		return &awsapi.GetMicrovmOutput{
+			MicrovmID:               "mvm-123",
+			State:                   "RUNNING",
+			EgressNetworkConnectors: []string{wantConnector, wantConnector},
+		}, nil
+	}
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN)
+
+	require.ErrorIs(t, err, microvm.ErrEgressMismatch)
+	require.Len(t, mock.TerminateMicrovmCalls, 1, "runtime metadata must contain the exact connector list, including cardinality")
 }
 
 func TestLaunch_IngressOverride(t *testing.T) {
@@ -96,6 +272,7 @@ func TestLaunch_IngressOverride(t *testing.T) {
 
 func TestLaunch_PollsPendingToRunning(t *testing.T) {
 	mock := &awsapi.Mock{}
+	setImageEgress(mock, publicEgressConnectors())
 	mock.RunMicrovmFn = func(_ context.Context, _ *awsapi.RunMicrovmInput) (*awsapi.RunMicrovmOutput, error) {
 		return &awsapi.RunMicrovmOutput{MicrovmID: "mvm-x", State: "PENDING"}, nil
 	}
@@ -105,7 +282,10 @@ func TestLaunch_PollsPendingToRunning(t *testing.T) {
 		if calls < 3 {
 			return &awsapi.GetMicrovmOutput{MicrovmID: "mvm-x", State: "PENDING"}, nil
 		}
-		return &awsapi.GetMicrovmOutput{MicrovmID: "mvm-x", Endpoint: "ep-x", State: "RUNNING"}, nil
+		return &awsapi.GetMicrovmOutput{
+			MicrovmID: "mvm-x", Endpoint: "ep-x", State: "RUNNING",
+			EgressNetworkConnectors: publicEgressConnectors(),
+		}, nil
 	}
 	mgr := microvm.NewWithAPI(mock,
 		microvm.WithRegion("us-east-1"),
@@ -120,6 +300,7 @@ func TestLaunch_PollsPendingToRunning(t *testing.T) {
 
 func TestLaunch_TerminatedDuringProvisioning_Fails(t *testing.T) {
 	mock := &awsapi.Mock{}
+	setImageEgress(mock, publicEgressConnectors())
 	mock.RunMicrovmFn = func(_ context.Context, _ *awsapi.RunMicrovmInput) (*awsapi.RunMicrovmOutput, error) {
 		return &awsapi.RunMicrovmOutput{MicrovmID: "mvm-x", State: "PENDING"}, nil
 	}
@@ -134,13 +315,35 @@ func TestLaunch_TerminatedDuringProvisioning_Fails(t *testing.T) {
 	require.ErrorIs(t, err, microvm.ErrVMProvisionFailed)
 }
 
+func TestLaunch_GetMicrovmFailureTerminatesUnverifiedVM(t *testing.T) {
+	mock := &awsapi.Mock{}
+	setImageEgress(mock, publicEgressConnectors())
+	mock.RunMicrovmFn = func(_ context.Context, _ *awsapi.RunMicrovmInput) (*awsapi.RunMicrovmOutput, error) {
+		return &awsapi.RunMicrovmOutput{MicrovmID: "mvm-x", State: "PENDING"}, nil
+	}
+	mock.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		return nil, errors.New("metadata unavailable")
+	}
+
+	_, err := newTestManager(mock).Launch(context.Background(), testImageARN)
+
+	require.ErrorContains(t, err, "metadata unavailable")
+	require.Len(t, mock.TerminateMicrovmCalls, 1, "a VM whose runtime metadata cannot be verified must be terminated")
+	assert.Equal(t, "mvm-x", mock.TerminateMicrovmCalls[0].MicrovmIdentifier)
+}
+
 func TestLaunch_ContextCanceled_AbortsPoll(t *testing.T) {
 	mock := &awsapi.Mock{}
+	setImageEgress(mock, publicEgressConnectors())
 	mock.RunMicrovmFn = func(_ context.Context, _ *awsapi.RunMicrovmInput) (*awsapi.RunMicrovmOutput, error) {
 		return &awsapi.RunMicrovmOutput{MicrovmID: "mvm-x", State: "PENDING"}, nil
 	}
 	mock.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
 		return &awsapi.GetMicrovmOutput{MicrovmID: "mvm-x", State: "PENDING"}, nil // never RUNNING
+	}
+	mock.TerminateMicrovmFn = func(cleanupCtx context.Context, _ *awsapi.TerminateMicrovmInput) error {
+		assert.NoError(t, cleanupCtx.Err(), "cleanup must not reuse the expired launch context")
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -151,6 +354,7 @@ func TestLaunch_ContextCanceled_AbortsPoll(t *testing.T) {
 	_, err := mgr.Launch(ctx, testImageARN)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
+	require.Len(t, mock.TerminateMicrovmCalls, 1, "a timed-out launch must terminate its unverified VM")
 }
 
 func TestAttach_RunningReturnsSandbox(t *testing.T) {

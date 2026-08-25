@@ -61,20 +61,54 @@ func TestWithIngress_SetsOverride(t *testing.T) {
 
 // --- WithEgress ---
 
-func TestWithEgress_None(t *testing.T) {
-	cfg, err := microvm.ApplyLaunchOptions(microvm.WithEgress(microvm.EgressNone))
-	require.NoError(t, err)
-	assert.Equal(t, microvm.EgressNone, cfg.Egress)
+func TestWithEgress_NoneRequiresConnector(t *testing.T) {
+	_, err := microvm.ApplyLaunchOptions(microvm.WithEgress(microvm.EgressNone))
+	require.ErrorIs(t, err, microvm.ErrInvalidOption)
+}
+
+func TestWithEgress_DefaultInheritsImage(t *testing.T) {
+	cfg := microvm.DefaultLaunchConfig()
+	assert.False(t, cfg.EgressExplicit)
 }
 
 func TestWithEgress_Public(t *testing.T) {
 	cfg, err := microvm.ApplyLaunchOptions(microvm.WithEgress(microvm.EgressPublic))
 	require.NoError(t, err)
 	assert.Equal(t, microvm.EgressPublic, cfg.Egress)
+	assert.True(t, cfg.EgressExplicit)
 }
 
-func TestWithEgress_VPC_Errors(t *testing.T) {
+func TestWithEgress_VPCRequiresConnector(t *testing.T) {
 	_, err := microvm.ApplyLaunchOptions(microvm.WithEgress(microvm.EgressVPC))
+	require.ErrorIs(t, err, microvm.ErrInvalidOption)
+}
+
+func TestWithEgressConnector_None(t *testing.T) {
+	const connector = "arn:aws:lambda:us-east-1:123456789012:network-connector:whim-no-egress"
+	cfg, err := microvm.ApplyLaunchOptions(microvm.WithEgressConnector(microvm.EgressNone, connector))
+	require.NoError(t, err)
+	assert.Equal(t, microvm.EgressNone, cfg.Egress)
+	assert.Equal(t, connector, cfg.EgressConnectorARN)
+	assert.True(t, cfg.EgressExplicit)
+}
+
+func TestWithExpectedNoPublicEgress_RecordsValidationWithoutOverridingImage(t *testing.T) {
+	expected := microvm.NoPublicEgressResources{
+		ConnectorARN:     testNoPublicConnector,
+		SubnetIDs:        []string{"subnet-safe"},
+		SecurityGroupIDs: []string{"sg-safe"},
+	}
+
+	cfg, err := microvm.ApplyLaunchOptions(microvm.WithExpectedNoPublicEgress(expected))
+
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ExpectedNoPublicEgress)
+	assert.Equal(t, expected, *cfg.ExpectedNoPublicEgress)
+	assert.False(t, cfg.EgressExplicit, "validation must not replace the connector baked into image metadata")
+}
+
+func TestWithEgressConnector_PublicErrors(t *testing.T) {
+	_, err := microvm.ApplyLaunchOptions(microvm.WithEgressConnector(microvm.EgressPublic, "arn:custom"))
 	require.ErrorIs(t, err, microvm.ErrInvalidOption)
 }
 
@@ -84,12 +118,13 @@ func TestOptions_ComposeCorrectly(t *testing.T) {
 	cfg, err := microvm.ApplyLaunchOptions(
 		microvm.WithTTL(30*time.Minute),
 		microvm.WithIngress("arn:custom"),
-		microvm.WithEgress(microvm.EgressNone),
+		microvm.WithEgressConnector(microvm.EgressNone, "arn:connector"),
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 30*time.Minute, cfg.TTL)
 	assert.Equal(t, "arn:custom", cfg.IngressOverride)
 	assert.Equal(t, microvm.EgressNone, cfg.Egress)
+	assert.Equal(t, "arn:connector", cfg.EgressConnectorARN)
 }
 
 func TestApplyLaunchOptions_ReturnsFirstError(t *testing.T) {

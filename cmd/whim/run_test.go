@@ -217,12 +217,24 @@ func TestRunDetach_RecordsRunMicrovmAndNeverTerminates(t *testing.T) {
 		return &awsapi.RunMicrovmOutput{MicrovmID: "mvm-detached", Endpoint: "example.invalid", State: "RUNNING"}, nil
 	}
 	mock.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
-		return &awsapi.GetMicrovmOutput{MicrovmID: "mvm-detached", Endpoint: "example.invalid", State: "RUNNING"}, nil
+		return &awsapi.GetMicrovmOutput{
+			MicrovmID: "mvm-detached", Endpoint: "example.invalid", State: "RUNNING",
+			EgressNetworkConnectors: []string{"arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"},
+		}, nil
+	}
+	mock.GetMicrovmImageFn = func(_ context.Context, in *awsapi.GetMicrovmImageInput) (*awsapi.GetMicrovmImageOutput, error) {
+		return &awsapi.GetMicrovmImageOutput{ImageARN: in.ImageIdentifier, State: "CREATED", LatestActiveImageVersion: "1"}, nil
+	}
+	mock.GetMicrovmImageVersionFn = func(_ context.Context, _ *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
+		return &awsapi.GetMicrovmImageVersionOutput{
+			EgressConnectors: []string{"arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"},
+		}, nil
 	}
 
 	orig := newManager
 	defer func() { newManager = orig }()
-	newManager = func(_ aws.Config, opts ...microvm.Option) *microvm.Manager {
+	newManager = func(cfg aws.Config, opts ...microvm.Option) *microvm.Manager {
+		opts = append(opts, microvm.WithRegion(cfg.Region))
 		return microvm.NewWithAPI(mock, opts...)
 	}
 
@@ -249,6 +261,67 @@ func TestRunDetach_RecordsRunMicrovmAndNeverTerminates(t *testing.T) {
 	assert.False(t, idle.AutoResumeEnabled, "--no-auto-resume must flip AutoResumeEnabled off end to end")
 
 	assert.Equal(t, "mvm-detached\n", out.String(), "run -d prints just the bare id, no timestamp, so it's scriptable")
+}
+
+func TestRunDetach_CachedEgressNoneValidatesAndOverridesPublicBuildConnector(t *testing.T) {
+	t.Setenv("WHIM_CONFIG_DIR", t.TempDir())
+	const connector = "arn:aws:lambda:us-east-1:123456789012:network-connector:whim-no-egress"
+	cfgFile := &Config{}
+	cfgFile.SetImage("airgap", "arn:aws:lambda:us-east-1:123456789012:microvm-image:airgap")
+	cfgFile.SetEgress("airgap", "none")
+	cfgFile.SetEgressConnector("airgap", connector)
+	cfgFile.SetEgressResourceGroup("airgap", EgressResourceGroup{
+		VPCID: "vpc-custom", SubnetIDs: []string{"subnet-a"}, RouteTableIDs: []string{"rtb-custom"},
+		SecurityGroupIDs: []string{"sg-a"}, ConnectorARN: connector,
+	})
+	require.NoError(t, SaveConfig(cfgFile))
+
+	mock := &awsapi.Mock{}
+	mock.RunMicrovmFn = func(_ context.Context, _ *awsapi.RunMicrovmInput) (*awsapi.RunMicrovmOutput, error) {
+		return &awsapi.RunMicrovmOutput{MicrovmID: "mvm-airgap", Endpoint: "example.invalid", State: "RUNNING"}, nil
+	}
+	mock.GetMicrovmFn = func(_ context.Context, _ *awsapi.GetMicrovmInput) (*awsapi.GetMicrovmOutput, error) {
+		return &awsapi.GetMicrovmOutput{
+			MicrovmID: "mvm-airgap", Endpoint: "example.invalid", State: "RUNNING",
+			EgressNetworkConnectors: []string{connector},
+		}, nil
+	}
+	mock.GetMicrovmImageFn = func(_ context.Context, in *awsapi.GetMicrovmImageInput) (*awsapi.GetMicrovmImageOutput, error) {
+		return &awsapi.GetMicrovmImageOutput{ImageARN: in.ImageIdentifier, State: "CREATED", LatestActiveImageVersion: "1"}, nil
+	}
+	mock.GetMicrovmImageVersionFn = func(context.Context, *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
+		return &awsapi.GetMicrovmImageVersionOutput{
+			EgressConnectors: []string{"arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"},
+		}, nil
+	}
+	mock.GetNetworkConnectorFn = func(context.Context, *awsapi.GetNetworkConnectorInput) (*awsapi.GetNetworkConnectorOutput, error) {
+		return &awsapi.GetNetworkConnectorOutput{
+			ARN: connector, Name: "whim-no-egress", State: awsapi.NetworkConnectorStateActive,
+			SubnetIDs: []string{"subnet-a"}, SecurityGroupIDs: []string{"sg-a"},
+		}, nil
+	}
+	configureCallerManagedTopology(mock, "subnet-a", "sg-a")
+
+	orig := newManager
+	defer func() { newManager = orig }()
+	newManager = func(cfg aws.Config, opts ...microvm.Option) *microvm.Manager {
+		opts = append(opts, microvm.WithRegion(cfg.Region))
+		return microvm.NewWithAPI(mock, opts...)
+	}
+
+	cmd := runnableTestRunCmd()
+	require.NoError(t, cmd.Flags().Set("image", "airgap"))
+	require.NoError(t, cmd.Flags().Set("detach", "true"))
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+
+	err := runRun(cmd, nil)
+	require.NoError(t, err)
+	require.Len(t, mock.RunMicrovmCalls, 1)
+	assert.Equal(t, []string{connector}, mock.RunMicrovmCalls[0].EgressNetworkConnectors,
+		"cached --egress none must launch with the recorded connector")
+	assert.Empty(t, mock.GetMicrovmImageVersionCalls,
+		"the explicit runtime policy must not inherit the image's public build connector")
 }
 
 func TestExecCmd_InteractiveFlagsPresent(t *testing.T) {

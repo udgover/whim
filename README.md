@@ -69,7 +69,7 @@ go install ./cmd/whim
 | `whim suspend <id>` / `whim resume <id>` | Pause/restart a VM (disk + memory preserved). |
 | `whim rm <id…>` | Terminate VMs **by id** — like `suspend`/`resume`/`exec`, no ownership check (contrast `gc`). Idempotent on an already-gone id. |
 | `whim image ls` [`-q`] [`--json`] / `whim image rm <name…>` | Manage built images. |
-| `whim build <source> --name <n>` [`--egress public\|none`] [`--force`] [`--context-subdir <p>`] [`--json`] | Build a custom image from a local dir/Dockerfile, `s3://`/`https://` archive, or `github.com/org/repo@ref`; caches the ARN under `--name`. |
+| `whim build <source> --name <n>` [`--egress public\|none`] [`--egress-connector <arn|name>`] [`--egress-auto-provision`] [`--force`] [`--context-subdir <p>`] [`--json`] | Build a custom image from a local dir/Dockerfile, `s3://`/`https://` archive, or `github.com/org/repo@ref`; caches the ARN under `--name`. See "Building custom images" for the full `--egress-*` flag set. |
 | `whim init` [`--image-name <n>`] [`--force`] / `whim preflight-check` / `whim version` | Bootstrap, checks, version. |
 
 Global flags: `--region`, `--profile`. `shell`/`run` also take `--image <name|arn>`
@@ -85,7 +85,9 @@ bootstrap (artifact bucket, build role, managed base image) as `init`.
 
 ```bash
 whim build ./app          --name whim-app                       # local build context (Dockerfile at its root)
-whim build ./Dockerfile   --name whim-min  --egress none        # a single local Dockerfile, airgapped image
+whim build ./Dockerfile   --name whim-min  --egress none --egress-connector whim-no-egress
+whim build ./app --name whim-isolated --egress none --egress-auto-provision \
+  --egress-operator-role arn:aws:iam::123456789012:role/whim-network-operator
 whim build s3://my-bucket/app.zip            --name whim-s3 --json
 whim build https://example.com/app.zip       --name whim-https
 GITHUB_TOKEN=… whim build github.com/org/repo@<full-sha> --name whim-repo --force
@@ -100,12 +102,62 @@ the `microvm` library transports are local, `s3://`, and `https://` only.
 - **`--name` is required** and is the cache key: a second `whim build --name X`
   reuses the existing image `X` unless you pass `--force` (which deletes and
   rebuilds). Name-as-key means a changed source does **not** rebuild on its own.
-- **`--egress public|none`** fixes the image's outbound policy at build time
-  (inherited by every VM launched from it). `none` is airgapped.
+- **`--egress public|none`** records the image's intended runtime egress policy.
+  AWS associates network connectors at `run-microvm` time, and public internet
+  egress is the service default.
+  `public` uses AWS's managed `INTERNET_EGRESS` connector. `none` means
+  **`NO_PUBLIC_EGRESS`** — direct public IP and public-hostname HTTPS
+  connections fail — **not** a native `NO_EGRESS` mode; AWS does not document
+  one, and Whim never claims otherwise (see Security model below for exactly
+  what's tested). `--egress none` requires exactly one of:
+  - **`--egress-auto-provision`** — Whim creates (or safely reuses) a
+    dedicated VPC, subnet, route table, security group, and Lambda Core
+    connector with no public/default route and zero security-group egress
+    rules. Requires **`--egress-operator-role`**: an existing IAM role ARN
+    trusting `lambda.amazonaws.com` with `AWSLambdaNetworkConnectorOperatorPolicy`
+    attached. **Whim never creates this role itself** — create it once and
+    reuse it. Override naming/CIDRs with `--egress-resource-prefix` (default
+    `whim`), `--egress-vpc-cidr` (default `10.242.99.0/24`), and
+    `--egress-subnet-cidr` (default `10.242.99.0/25`) if the defaults
+    collide with a network you already use.
+  - **`--egress-connector <arn|name>`** — point at a connector you already
+    manage. Whim resolves its live subnet/route-table/security-group topology
+    and rejects it unless every route is VPC-local and every attached security
+    group has zero outbound rules.
+  - **`--egress-subnet`/`--egress-security-group` with an explicit
+    `--egress-connector-name`** — an advanced escape hatch: Whim creates only
+    the Lambda Core connector, against subnets/security groups you already
+    own, with no VPC creation. Whim verifies that an existing same-named
+    connector matches the supplied subnet/security-group IDs, then applies the
+    same no-public-route/zero-egress validation. `--egress-connector-name` must
+    be given explicitly here — its default value is never used silently.
+
+  Combining more than one of the above is rejected, as is any flag that
+  belongs to a mode you didn't select (e.g. `--egress-connector` with
+  `--egress-vpc-cidr`) — they would otherwise be silently ignored.
+  **`--egress-strict-dns` is not implemented**: DNS resolution is not
+  blocked under `--egress none` (see Security model).
+
+  **Build-time and runtime egress are deliberately separate.** Image creation
+  always uses public egress so the service can pull the container base and run
+  network-dependent build steps. For `--egress none`, Whim then launches every
+  VM with the recorded isolated connector as an explicit override, after
+  revalidating its VPC topology. Runtime metadata must report exactly that
+  connector or Whim terminates the unverified VM. The rationale is recorded in
+  [ADR-001](docs/decisions/001-separate-build-and-runtime-egress.md).
+
+  For the AWS requirements (operator role, caller permissions, service-linked
+  role) and how to grant them following least privilege, see
+  [docs/no-public-egress-setup.md](docs/no-public-egress-setup.md). For a
+  repeatable manual test of every `--egress*` switch end-to-end, see
+  [docs/no-public-egress-test-protocol.md](docs/no-public-egress-test-protocol.md).
 - **`--context-subdir <p>`** descends into a subdirectory before locating the
   `Dockerfile` (also strips a single wrapping top-level dir from forge archives).
 - **`--json`** prints one redacted object `{name, arn, source, cached, egress}`
-  and suppresses progress chatter.
+  plus `egress_connector` and the validated `egress_resource_group` topology
+  (`vpc_id`, subnet/route-table/security-group IDs, and `resource_group` for
+  auto-provisioned resources) for `--egress none`, and suppresses progress
+  chatter.
 - **GitHub auth:** set `GITHUB_TOKEN` for private repos — it is sent only as a
   request header, never placed in a URL, printed, logged, or written to config.
   A full commit SHA ref is an immutable source identity; branches/tags are moving.
@@ -234,11 +286,11 @@ default-bootstrap convenience live in the CLI, not here:
 
 ```go
 arn, err := mgr.BuildFromSource(ctx, "./app", microvm.BuildFromSourceOptions{
-    Name:           "whim-app",            // image name = reuse/cache key (required)
-    ArtifactBucket: "my-artifact-bucket",  // caller-owned; staged context uploads here (required)
-    BaseImageARN:   baseImageARN,          // managed/base image to build on (required)
-    BuildRoleARN:   buildRoleARN,          // role the build assumes to read the staged artifact (required)
-    Egress:         microvm.EgressNone,    // outbound policy, fixed at build time
+    Name:               "whim-app",            // image name = reuse/cache key (required)
+    ArtifactBucket:     "my-artifact-bucket",  // caller-owned; staged context uploads here (required)
+    BaseImageARN:       baseImageARN,          // managed/base image to build on (required)
+    BuildRoleARN:       buildRoleARN,          // role the build assumes to read the staged artifact (required)
+    Egress:             microvm.EgressPublic, // build-time access for the container base and RUN steps
     // Force, ContextSubdir, HTTPSHeaders, MaxCompressedBytes, MaxUncompressedBytes …
 })
 ```
@@ -247,16 +299,59 @@ arn, err := mgr.BuildFromSource(ctx, "./app", microvm.BuildFromSourceOptions{
 `https://host/path`; `http://`, credential-bearing URL userinfo, and unknown
 schemes are rejected.
 
+The isolated runtime connector can be your own connector, or come from
+`Manager.EnsureNoPublicEgressConnector`, which the CLI wraps for
+`--egress-auto-provision`. It discovers-and-validates a Whim-managed
+`NO_PUBLIC_EGRESS` VPC/subnet/route table/security group/connector, reusing
+it only after every layer passes validation, and creates one when nothing
+safe exists to reuse (never falling back to public egress on failure):
+
+```go
+resources, err := mgr.EnsureNoPublicEgressConnector(ctx, microvm.NoPublicEgressSpec{
+    OperatorRoleARN: operatorRoleARN, // existing role; Whim never creates it (required to create)
+    VPCCIDRBlock:    "10.242.99.0/24", // required to create; no default at the library level
+    SubnetCIDRBlock: "10.242.99.0/25",
+})
+// resources.ConnectorARN, .VPCID, .SubnetIDs, .RouteTableID, .SecurityGroupID
+
+sb, err := mgr.Launch(ctx, arn,
+    microvm.WithEgressConnector(microvm.EgressNone, resources.ConnectorARN),
+    microvm.WithExpectedNoPublicEgress(*resources),
+)
+```
+
+For a caller-managed connector, use `ValidateNoPublicEgressConnector` before
+launch and pass its result through the same two launch options. The first sets
+the exact runtime connector; the second revalidates its recorded live topology.
+
 Errors are typed sentinels (match with `errors.Is`): `ErrInvalidOption`,
 `ErrInvalidSource`, `ErrSourceTooLarge`, `ErrImageNotFound`,
 `ErrVMProvisionFailed`, `ErrImageBuildFailed`, `ErrConnClosed`, `ErrTimeout`,
-`ErrTerminated`. For tests, inject a mock via `NewWithAPI`.
+`ErrTerminated`. `EnsureNoPublicEgressConnector` additionally wraps
+`ErrConnectorMissing`, `ErrConnectorNotActive`, `ErrResourceNotOwned`,
+`ErrPublicRoute`, `ErrSecurityGroupEgress`, `ErrTopologyMismatch`, and
+`ErrOperatorRoleInvalid` in a `*NoPublicEgressViolation` (or
+`*PartialNoPublicEgressCreationError` for a mid-creation failure) — see
+Troubleshooting above for what each means. For tests, inject a mock via
+`NewWithAPI`.
 
 ## Security model
 
 The VM runs **your code as root**, reachable only through an authenticated
 WebSocket. whim's guarantees:
 
+- **`--egress none` is `NO_PUBLIC_EGRESS`, live-tested, not just documented.**
+  A MicroVM launched with a recorded `--egress none` policy cannot reach a direct
+  public IP or a public hostname over HTTPS: both time out at TCP connect,
+  verified by the gated `TestIntegration_NoPublicEgress` flow against a real
+  Whim-managed connector. **DNS resolution
+  is not blocked**: `getent hosts`/`nslookup` inside the VM still resolves
+  public hostnames to real IPs; only the resulting connection fails. Security
+  groups and network ACLs cannot filter traffic to AWS's own DNS resolver, so
+  this is `NO_PUBLIC_EGRESS`, never claimed as AWS's undocumented (and
+  unsupported) `NO_EGRESS`, and never silently claimed as blocking DNS.
+  MicroVM metadata for a `--egress none` launch always reports the
+  customer-managed connector, never `INTERNET_EGRESS`.
 - **Shell tokens are never logged** (the `X-aws-proxy-auth` value lives only in
   the request header).
 - **Injection-only credentials** — `microvm` never sources ambient credentials.
@@ -281,6 +376,53 @@ whim-owned VMs. The **id-targeted** commands (`exec`, `put`, `get`, `suspend`,
 like `ssh <host>`, naming the target is the authorization. In a shared account,
 an explicit `whim rm <foreign-id>` could **terminate** someone else's workload.
 
+## Troubleshooting `--egress-auto-provision`
+
+`--egress-auto-provision` fails closed rather than silently falling back to
+public egress or "fixing" a resource it doesn't fully trust. The error names
+which check failed:
+
+- **`no-public-egress connector not found`** — nothing exists yet under the
+  expected connector name. This is the normal trigger for creation, not an
+  error unless creation itself then also fails.
+- **`... exists but is not ACTIVE`** — a same-named connector exists but is
+  `PENDING` (Whim polls this to `ACTIVE` automatically and proceeds), or
+  `FAILED`/`INACTIVE`/`DELETING`/`DELETE_FAILED` (Whim does not retry these —
+  inspect it with `aws lambda-core get-network-connector --identifier <name>`
+  and delete/recreate it manually).
+- **`resource is not tagged as Whim-managed`** — a resource matching the
+  expected name/ID exists but lacks Whim's `ManagedBy=whim` tag. Whim never
+  reuses a resource it doesn't recognize as its own, even if its shape looks
+  safe.
+- **`resource topology does not match expected no-public-egress shape`** —
+  drift: a connector, route table, or NACL exists but is associated with
+  different subnets/security groups than Whim expects. Whim never repairs
+  this automatically or creates a second resource group under the same name.
+- **`route table has a public or default egress route`** / **`security
+  group has an outbound rule`** — the managed route table or security group
+  has drifted from the no-public-egress shape (a public/default route, or
+  any egress rule at all — even a narrow one). Whim fails closed rather than
+  treating a partially-open network as isolated.
+- **`operator role is not usable by Lambda Core network connectors`** — your
+  `--egress-operator-role` either doesn't exist, doesn't trust
+  `lambda.amazonaws.com`, or has no attached/inline policies at all. This
+  check cannot fully verify the role's *permissions* (that needs
+  `iam:GetPolicyVersion`/`GetRolePolicy`, which Whim doesn't call), so a role
+  that passes it can still fail at connector creation with an AWS
+  `AccessDenied` if its policy doesn't actually grant
+  `ec2:CreateNetworkInterface`. Attach the AWS-managed
+  `AWSLambdaNetworkConnectorOperatorPolicy` for the minimum permissions.
+- **Partial creation failure** — if creation fails partway (e.g. the VPC and
+  subnet were created but security-group creation then failed), the error
+  names every resource ID created so far. Whim never rolls these back
+  automatically — find and delete them manually; there is no `whim egress
+  rm` yet.
+
+Whim never creates the IAM operator role itself: create it once (trust
+`lambda.amazonaws.com`, attach `AWSLambdaNetworkConnectorOperatorPolicy`) and
+reuse its ARN via `--egress-operator-role` for every `--egress-auto-provision`
+build.
+
 ## v0.1 limitations
 
 - **Ownership is image-derived, not tagged.** Lambda MicroVMs can't be tagged, so
@@ -292,6 +434,16 @@ an explicit `whim rm <foreign-id>` could **terminate** someone else's workload.
 - **Transfers are in-memory**, capped at 256 MiB per `put`/`get`.
 - **Reconnect yields a new shell** (disk persists, in-memory shell state does not).
 - Terminal **resize isn't forwarded** yet (full-screen apps use the default size).
+- **Strict DNS is not implemented ([#7](https://github.com/udgover/whim/issues/7)).** `--egress none` (with or without
+  `--egress-auto-provision`) never blocks DNS resolution; `--egress-strict-dns`
+  is rejected until this is built and live-verified.
+- **Whim never creates the IAM operator role.** `--egress-auto-provision`
+  requires an existing `--egress-operator-role`; Whim only validates it
+  (trust principal, presence of a policy), never calls `iam:CreateRole`.
+- **No cleanup command for auto-provisioned resources yet.** `whim image rm`
+  never deletes the VPC/subnet/route table/security group/connector an
+  `--egress-auto-provision` build created — delete them manually (see
+  Troubleshooting above) until a dedicated command exists.
 
 ## Tests
 
@@ -308,11 +460,20 @@ build real images using your `whim init` artifact bucket and build role:
 WHIM_INTEGRATION=1 go test -tags=integration ./...
 ```
 
-The local-directory and `--egress none` builds run as-is; set
-`WHIM_TEST_HTTPS_ZIP` (an `https://` zip whose Dockerfile is at the root) and
-`WHIM_TEST_GITHUB=org/repo@<full-sha>` (plus `GITHUB_TOKEN` for private repos) to
-exercise the remote-source paths. Override the derived inputs with
-`WHIM_TEST_ARTIFACT_BUCKET` / `WHIM_TEST_BUILD_ROLE` / `WHIM_TEST_BASE_IMAGE`.
+The local-directory build runs as-is. Set `WHIM_TEST_EGRESS_CONNECTOR` to an
+isolated Lambda Core VPC connector ARN to run the public-build/isolated-runtime
+integration test. Set `WHIM_TEST_EGRESS_OPERATOR_ROLE` to an IAM role ARN
+(trusting `lambda.amazonaws.com`, `AWSLambdaNetworkConnectorOperatorPolicy`
+attached) to run `TestIntegration_NoPublicEgress`, which provisions/reuses a real
+no-public-egress resource group via `EnsureNoPublicEgressConnector`, asserts
+MicroVM metadata never reports `INTERNET_EGRESS`, and asserts a direct public
+IP and an HTTPS public hostname both fail to connect. The same steps are in
+[docs/no-public-egress-test-protocol.md](docs/no-public-egress-test-protocol.md).
+Set `WHIM_TEST_HTTPS_ZIP` (an `https://` zip whose Dockerfile is at the
+root) and `WHIM_TEST_GITHUB=org/repo@<full-sha>` (plus `GITHUB_TOKEN` for
+private repos) to exercise the remote-source paths. Override the derived inputs
+with `WHIM_TEST_ARTIFACT_BUCKET` / `WHIM_TEST_BUILD_ROLE` /
+`WHIM_TEST_BASE_IMAGE`.
 
 ## License
 

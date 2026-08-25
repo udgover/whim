@@ -3,6 +3,7 @@ package microvm
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -16,16 +17,19 @@ const (
 	defaultTTL = 25 * time.Minute
 )
 
-// EgressMode controls the outbound network policy, fixed at image-build time
-// and asserted at launch.
+// EgressMode controls the outbound connector set Whim records for an image and
+// applies when launching a MicroVM. AWS associates network connectors at
+// run-microvm time.
 type EgressMode int
 
 const (
 	// EgressPublic enables outbound internet access via the managed INTERNET_EGRESS connector.
 	EgressPublic EgressMode = iota
-	// EgressNone produces an airgapped VM with no outbound network connectivity.
+	// EgressNone routes through a caller-managed isolated VPC connector. AWS
+	// does not currently expose a managed NO_EGRESS connector, so the connector's
+	// VPC routing and security controls must deny public internet access.
 	EgressNone
-	// EgressVPC routes outbound traffic through a customer-managed VPC connector (v0.2).
+	// EgressVPC routes outbound traffic through a customer-managed VPC connector.
 	EgressVPC
 )
 
@@ -46,8 +50,15 @@ type IdlePolicy struct {
 // Build it via ApplyLaunchOptions; do not construct directly. Connector ARNs
 // are derived from the Manager's region at launch time, not stored here.
 type LaunchConfig struct {
-	TTL    time.Duration
-	Egress EgressMode
+	TTL time.Duration
+	// Egress is applied only when EgressExplicit is true. Otherwise Launch
+	// derives egress from the image's latest active version.
+	Egress             EgressMode
+	EgressConnectorARN string
+	EgressExplicit     bool
+	// ExpectedNoPublicEgress validates the resolved launch connector and the
+	// caller-recorded backing topology immediately before launch.
+	ExpectedNoPublicEgress *NoPublicEgressResources
 	// IngressOverride, when non-empty, replaces the default SHELL_INGRESS
 	// connector; the default (empty) is resolved to a region-specific
 	// SHELL_INGRESS ARN at launch.
@@ -103,20 +114,71 @@ func WithIngress(connectorARN string) LaunchOption {
 	}
 }
 
-// WithEgress sets the egress policy. EgressNone produces an airgapped VM.
-// The actual connector ARNs are derived from the region at launch.
-// EgressVPC is not yet supported (v0.2).
+// WithEgress sets the egress policy. EgressPublic uses the AWS-managed
+// INTERNET_EGRESS connector. EgressNone and EgressVPC require
+// WithEgressConnector because AWS does not expose a managed NO_EGRESS connector.
 func WithEgress(mode EgressMode) LaunchOption {
 	return func(cfg *LaunchConfig) error {
 		switch mode {
-		case EgressNone, EgressPublic:
+		case EgressPublic:
 			cfg.Egress = mode
+			cfg.EgressConnectorARN = ""
+			cfg.EgressExplicit = true
 			return nil
+		case EgressNone:
+			return fmt.Errorf("%w: EgressNone requires WithEgressConnector with an isolated VPC network connector ARN", ErrInvalidOption)
 		case EgressVPC:
-			return fmt.Errorf("%w: EgressVPC is not supported in v0.1", ErrInvalidOption)
+			return fmt.Errorf("%w: EgressVPC requires WithEgressConnector with a VPC network connector ARN", ErrInvalidOption)
 		default:
 			return fmt.Errorf("%w: unknown egress mode %d", ErrInvalidOption, mode)
 		}
+	}
+}
+
+// WithEgressConnector routes runtime egress through a caller-managed Lambda Core
+// network connector ARN. For EgressNone semantics, the referenced VPC subnets,
+// route tables, security groups, and NACLs must deny public internet paths.
+func WithEgressConnector(mode EgressMode, connectorARN string) LaunchOption {
+	return func(cfg *LaunchConfig) error {
+		connectorARN = strings.TrimSpace(connectorARN)
+		if connectorARN == "" {
+			return fmt.Errorf("%w: egress connector ARN is required", ErrInvalidOption)
+		}
+		switch mode {
+		case EgressNone, EgressVPC:
+			cfg.Egress = mode
+			cfg.EgressConnectorARN = connectorARN
+			cfg.EgressExplicit = true
+			return nil
+		case EgressPublic:
+			return fmt.Errorf("%w: EgressPublic uses the managed INTERNET_EGRESS connector, not a custom connector", ErrInvalidOption)
+		default:
+			return fmt.Errorf("%w: unknown egress mode %d", ErrInvalidOption, mode)
+		}
+	}
+}
+
+// WithExpectedNoPublicEgress requires the resolved launch connector to match
+// resources.ConnectorARN, then revalidates its live VPC topology before launch.
+// Used alone it validates the connector inherited from image metadata. Pair it
+// with a matching WithEgressConnector(EgressNone, ...) to validate an explicit
+// runtime override. Populate the other resource fields to detect identifier
+// drift as well as unsafe route/security-group changes.
+func WithExpectedNoPublicEgress(resources NoPublicEgressResources) LaunchOption {
+	return func(cfg *LaunchConfig) error {
+		resources.ConnectorARN = strings.TrimSpace(resources.ConnectorARN)
+		if resources.ConnectorARN == "" {
+			return fmt.Errorf("%w: expected no-public-egress connector ARN is required", ErrInvalidOption)
+		}
+		if isInternetEgressConnector(resources.ConnectorARN) {
+			return fmt.Errorf("%w: EgressNone cannot use the managed INTERNET_EGRESS connector", ErrInvalidOption)
+		}
+		copy := resources
+		copy.SubnetIDs = append([]string(nil), resources.SubnetIDs...)
+		copy.RouteTableIDs = append([]string(nil), resources.RouteTableIDs...)
+		copy.SecurityGroupIDs = append([]string(nil), resources.SecurityGroupIDs...)
+		cfg.ExpectedNoPublicEgress = &copy
+		return nil
 	}
 }
 
@@ -155,9 +217,13 @@ type ImageSpec struct {
 	CodeArtifactURI string
 	// BuildRoleARN is the IAM role ARN Lambda assumes during the build.
 	BuildRoleARN string
-	// Egress controls which egress connectors are baked into the image.
-	// This is fixed at build time and inherited by every run.
+	// Egress controls which egress connectors Whim records for the image and
+	// mirrors at launch time.
 	Egress EgressMode
+	// EgressConnectorARN is required for EgressNone or EgressVPC. For
+	// EgressNone semantics, it must point at a VPC connector whose networking
+	// denies public internet paths.
+	EgressConnectorARN string
 	// Resources sets the baseline memory allocation for the image.
 	Resources *Resources
 	// Capabilities grants elevated Linux OS capabilities to the image's

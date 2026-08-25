@@ -29,7 +29,15 @@ func (m *Manager) BuildFromSource(ctx context.Context, source string, opts Build
 			return "", err
 		}
 	} else {
-		resolved, found, err := m.reuseImage(ctx, arn, opts.Name, opts.Capabilities)
+		resolved, found, err := m.reuseImage(ctx, arn, ImageSpec{
+			Name:               opts.Name,
+			BaseImageARN:       opts.BaseImageARN,
+			CodeArtifactURI:    "cached",
+			BuildRoleARN:       opts.BuildRoleARN,
+			Egress:             opts.Egress,
+			EgressConnectorARN: opts.EgressConnectorARN,
+			Capabilities:       opts.Capabilities,
+		})
 		if err != nil {
 			return "", err
 		}
@@ -43,12 +51,13 @@ func (m *Manager) BuildFromSource(ctx context.Context, source string, opts Build
 		return "", fmt.Errorf("stage source %q: %w", redactSource(source), err)
 	}
 	return m.EnsureImage(ctx, ImageSpec{
-		Name:            opts.Name,
-		BaseImageARN:    opts.BaseImageARN,
-		CodeArtifactURI: uri,
-		BuildRoleARN:    opts.BuildRoleARN,
-		Egress:          opts.Egress,
-		Capabilities:    opts.Capabilities,
+		Name:               opts.Name,
+		BaseImageARN:       opts.BaseImageARN,
+		CodeArtifactURI:    uri,
+		BuildRoleARN:       opts.BuildRoleARN,
+		Egress:             opts.Egress,
+		EgressConnectorARN: opts.EgressConnectorARN,
+		Capabilities:       opts.Capabilities,
 	})
 }
 
@@ -95,11 +104,13 @@ type BuildFromSourceOptions struct {
 	BaseImageARN string
 	// BuildRoleARN is the role the build assumes to read the staged artifact; required.
 	BuildRoleARN string
-	// Egress fixes the image's outbound policy; must be EgressPublic or
-	// EgressNone. Note the zero value is EgressPublic, so leaving this unset
-	// grants the image outbound internet — set it explicitly for an airgapped
-	// (EgressNone) build. The CLI always passes an explicit value.
+	// Egress records the image's intended outbound connector set; Whim mirrors
+	// it when launching VMs. Note the zero value is EgressPublic, so leaving this
+	// unset grants launched VMs outbound internet. EgressNone requires
+	// EgressConnectorARN; AWS has no managed NO_EGRESS connector.
 	Egress EgressMode
+	// EgressConnectorARN is required for EgressNone or EgressVPC.
+	EgressConnectorARN string
 	// Force deletes and rebuilds an existing image of the same name.
 	Force bool
 	// ContextSubdir descends into a subdirectory of the source before locating Dockerfile.
@@ -163,10 +174,8 @@ func (o BuildFromSourceOptions) validate() error {
 	case o.BuildRoleARN == "":
 		return fmt.Errorf("%w: build role ARN is required", ErrInvalidOption)
 	}
-	switch o.Egress {
-	case EgressPublic, EgressNone:
-	default:
-		return fmt.Errorf("%w: egress must be EgressPublic or EgressNone", ErrInvalidOption)
+	if _, err := egressConnectors(o.Egress, "validation-region", o.EgressConnectorARN); err != nil {
+		return err
 	}
 	return validateCapabilities(o.Capabilities)
 }

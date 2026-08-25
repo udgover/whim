@@ -31,6 +31,15 @@ func testSpec() microvm.ImageSpec {
 	}
 }
 
+func setPublicImageVersion(m *awsapi.Mock, caps []string) {
+	m.GetMicrovmImageVersionFn = func(_ context.Context, _ *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
+		return &awsapi.GetMicrovmImageVersionOutput{
+			Capabilities:     caps,
+			EgressConnectors: publicEgressConnectors(),
+		}, nil
+	}
+}
+
 // --- Constructors ---
 
 func TestNewWithAPI_ReturnsNonNil(t *testing.T) {
@@ -112,9 +121,7 @@ func createdImageWithCaps(t *testing.T, caps []string) *awsapi.Mock {
 	mock.GetMicrovmImageFn = func(_ context.Context, _ *awsapi.GetMicrovmImageInput) (*awsapi.GetMicrovmImageOutput, error) {
 		return &awsapi.GetMicrovmImageOutput{ImageARN: arn, State: "CREATED", LatestActiveImageVersion: "1.0"}, nil
 	}
-	mock.GetMicrovmImageVersionFn = func(_ context.Context, _ *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
-		return &awsapi.GetMicrovmImageVersionOutput{Capabilities: caps}, nil
-	}
+	setPublicImageVersion(mock, caps)
 	mock.CreateMicrovmImageFn = func(_ context.Context, _ *awsapi.CreateMicrovmImageInput) (*awsapi.CreateMicrovmImageOutput, error) {
 		t.Fatalf("must not rebuild an existing image")
 		return nil, nil
@@ -165,6 +172,21 @@ func TestEnsureImage_ReusesIgnoringDuplicateCapabilities(t *testing.T) {
 	assert.Empty(t, mock.CreateMicrovmImageCalls)
 }
 
+func TestEnsureImage_RejectsDuplicateNoPublicEgressConnectors(t *testing.T) {
+	mock := createdImageWithCaps(t, nil)
+	const connector = "arn:aws:lambda:us-east-1:123456789012:network-connector:whim-no-egress"
+	mock.GetMicrovmImageVersionFn = func(_ context.Context, _ *awsapi.GetMicrovmImageVersionInput) (*awsapi.GetMicrovmImageVersionOutput, error) {
+		return &awsapi.GetMicrovmImageVersionOutput{EgressConnectors: []string{connector, connector}}, nil
+	}
+	spec := testSpec()
+	spec.Egress = microvm.EgressNone
+	spec.EgressConnectorARN = connector
+
+	_, err := newTestManager(mock).EnsureImage(context.Background(), spec)
+
+	require.ErrorIs(t, err, microvm.ErrEgressMismatch)
+}
+
 // deleteRefusingMock fails the test if any delete is attempted, proving
 // validation runs before the destructive step.
 func deleteRefusingMock(t *testing.T) *awsapi.Mock {
@@ -191,7 +213,7 @@ func TestForceRebuildImage_ValidatesCapabilityBeforeDelete(t *testing.T) {
 func TestForceRebuildImage_ValidatesEgressBeforeDelete(t *testing.T) {
 	mock := deleteRefusingMock(t)
 	spec := testSpec()
-	spec.Egress = microvm.EgressVPC // unsupported
+	spec.Egress = microvm.EgressNone // connector ARN required
 
 	_, err := newTestManager(mock).ForceRebuildImage(context.Background(), spec)
 	require.Error(t, err)
@@ -222,19 +244,41 @@ func TestForceRebuildImage_ValidatesRequiredFieldsBeforeDelete(t *testing.T) {
 	}
 }
 
-func TestBuildImage_EgressNone_SendsEmptyConnectors(t *testing.T) {
+func TestBuildImage_EgressNone_RequiresConnector(t *testing.T) {
+	mock := &awsapi.Mock{}
+	spec := testSpec()
+	spec.Egress = microvm.EgressNone
+	_, err := newTestManager(mock).BuildImage(context.Background(), spec)
+	require.ErrorIs(t, err, microvm.ErrInvalidOption)
+	assert.Empty(t, mock.CreateMicrovmImageCalls)
+}
+
+func TestBuildImage_EgressNone_SendsConnector(t *testing.T) {
 	mock := &awsapi.Mock{}
 	mock.CreateMicrovmImageFn = func(_ context.Context, in *awsapi.CreateMicrovmImageInput) (*awsapi.CreateMicrovmImageOutput, error) {
-		assert.Empty(t, in.EgressConnectors)
+		assert.Equal(t, []string{"arn:connector"}, in.EgressConnectors)
 		return &awsapi.CreateMicrovmImageOutput{ImageARN: "arn:x", State: "CREATING"}, nil
 	}
 	spec := testSpec()
 	spec.Egress = microvm.EgressNone
+	spec.EgressConnectorARN = "arn:connector"
 	_, err := newTestManager(mock).BuildImage(context.Background(), spec)
 	require.NoError(t, err)
 }
 
-func TestBuildImage_EgressVPC_Errors(t *testing.T) {
+func TestBuildImage_EgressNone_RejectsInternetEgressConnector(t *testing.T) {
+	mock := &awsapi.Mock{}
+	spec := testSpec()
+	spec.Egress = microvm.EgressNone
+	spec.EgressConnectorARN = publicEgressConnectors()[0]
+
+	_, err := newTestManager(mock).BuildImage(context.Background(), spec)
+
+	require.ErrorIs(t, err, microvm.ErrInvalidOption)
+	assert.Empty(t, mock.CreateMicrovmImageCalls, "INTERNET_EGRESS must never be recorded as egress none")
+}
+
+func TestBuildImage_EgressVPC_RequiresConnector(t *testing.T) {
 	mock := &awsapi.Mock{}
 	spec := testSpec()
 	spec.Egress = microvm.EgressVPC
@@ -293,6 +337,7 @@ func TestEnsureImage_ExistingCreated_SkipsBuild(t *testing.T) {
 	mock.GetMicrovmImageFn = func(_ context.Context, _ *awsapi.GetMicrovmImageInput) (*awsapi.GetMicrovmImageOutput, error) {
 		return &awsapi.GetMicrovmImageOutput{ImageARN: arn, State: "CREATED"}, nil
 	}
+	setPublicImageVersion(mock, nil)
 	got, err := newTestManager(mock).EnsureImage(context.Background(), testSpec())
 	require.NoError(t, err)
 	assert.Equal(t, arn, got)
@@ -313,6 +358,7 @@ func TestEnsureImage_NotFound_BuildsThenPolls(t *testing.T) {
 	mock.CreateMicrovmImageFn = func(_ context.Context, _ *awsapi.CreateMicrovmImageInput) (*awsapi.CreateMicrovmImageOutput, error) {
 		return &awsapi.CreateMicrovmImageOutput{ImageARN: arn, State: "CREATING"}, nil
 	}
+	setPublicImageVersion(mock, nil)
 
 	mgr := microvm.NewWithAPI(mock,
 		microvm.WithRegion("us-east-1"),
@@ -339,6 +385,7 @@ func TestEnsureImage_PollsUntilCreated(t *testing.T) {
 	mock.CreateMicrovmImageFn = func(_ context.Context, _ *awsapi.CreateMicrovmImageInput) (*awsapi.CreateMicrovmImageOutput, error) {
 		return &awsapi.CreateMicrovmImageOutput{ImageARN: arn, State: "CREATING"}, nil
 	}
+	setPublicImageVersion(mock, nil)
 	mgr := microvm.NewWithAPI(mock,
 		microvm.WithRegion("us-east-1"),
 		microvm.WithAccountID("123456789012"),
@@ -416,6 +463,7 @@ func TestEnsureImage_Updated_ReturnsWithoutBuild(t *testing.T) {
 	mock.GetMicrovmImageFn = func(_ context.Context, _ *awsapi.GetMicrovmImageInput) (*awsapi.GetMicrovmImageOutput, error) {
 		return &awsapi.GetMicrovmImageOutput{ImageARN: arn, State: "UPDATED"}, nil
 	}
+	setPublicImageVersion(mock, nil)
 	got, err := newTestManager(mock).EnsureImage(context.Background(), testSpec())
 	require.NoError(t, err)
 	assert.Equal(t, arn, got)

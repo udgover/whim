@@ -23,6 +23,11 @@ import (
 // TestIntegration_OpenShellPreventsIdleSuspend).
 const ShellTokenLifetime = 30 * time.Minute
 
+// failedLaunchCleanupTimeout bounds detached cleanup after RunMicrovm has
+// accepted a launch but runtime state or egress metadata cannot be verified.
+// Cleanup must outlive the launch context, which is commonly the failure cause.
+const failedLaunchCleanupTimeout = 30 * time.Second
+
 // shellTokenExpiryMinutes is ShellTokenLifetime expressed for the mint API.
 const shellTokenExpiryMinutes = int32(ShellTokenLifetime / time.Minute)
 
@@ -284,8 +289,9 @@ func (m *Manager) resumeAndAttach(ctx context.Context, id string) (*Sandbox, err
 //
 // It always sets a server-side TTL (default 25m, cap 8h) as the cleanup
 // backstop, attaches the SHELL_INGRESS connector (or WithIngress override), and
-// applies the configured egress mode — all connector ARNs derived from the
-// Manager's region. The returned Sandbox must be Terminated by the caller.
+// mirrors the image's baked egress connectors unless an explicit egress option
+// overrides them. Managed connector ARNs are derived from the Manager's region.
+// The returned Sandbox must be Terminated by the caller.
 func (m *Manager) Launch(ctx context.Context, imageARN string, opts ...LaunchOption) (*Sandbox, error) {
 	if imageARN == "" {
 		return nil, fmt.Errorf("%w: imageARN is required", ErrInvalidOption)
@@ -303,9 +309,33 @@ func (m *Manager) Launch(ctx context.Context, imageARN string, opts ...LaunchOpt
 	if ingress == "" {
 		ingress = shellIngressConnectorARN(m.region)
 	}
-	egress, err := egressConnectors(cfg.Egress, m.region)
-	if err != nil {
-		return nil, err
+	var egress []string
+	if !cfg.EgressExplicit {
+		egress, err = m.imageEgressConnectors(ctx, imageARN)
+		if err != nil {
+			return nil, fmt.Errorf("resolve image egress: %w", err)
+		}
+	} else {
+		egress, err = egressConnectors(cfg.Egress, m.region, cfg.EgressConnectorARN)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if cfg.ExpectedNoPublicEgress != nil {
+		if cfg.EgressExplicit && cfg.Egress != EgressNone {
+			return nil, fmt.Errorf("%w: expected no-public-egress validation requires an EgressNone override", ErrInvalidOption)
+		}
+		if len(egress) != 1 || egress[0] != cfg.ExpectedNoPublicEgress.ConnectorARN {
+			return nil, fmt.Errorf("%w: launch resolved egress connectors %v, expected exactly [%s]", ErrEgressMismatch, egress, cfg.ExpectedNoPublicEgress.ConnectorARN)
+		}
+		if _, err := m.ValidateNoPublicEgressConnector(ctx, *cfg.ExpectedNoPublicEgress); err != nil {
+			return nil, fmt.Errorf("validate recorded no-public-egress resources before launch: %w", err)
+		}
+	}
+	if cfg.EgressExplicit && cfg.Egress == EgressNone && cfg.ExpectedNoPublicEgress == nil {
+		if _, err := m.ValidateNoPublicEgressConnector(ctx, NoPublicEgressResources{ConnectorARN: cfg.EgressConnectorARN}); err != nil {
+			return nil, fmt.Errorf("validate no-public-egress connector before launch: %w", err)
+		}
 	}
 	ttlSeconds := int32(cfg.TTL / time.Second)
 
@@ -336,6 +366,9 @@ func (m *Manager) Launch(ctx context.Context, imageARN string, opts ...LaunchOpt
 		}
 		switch g.State {
 		case "RUNNING":
+			if len(g.EgressNetworkConnectors) != len(egress) || !sameStringSet(g.EgressNetworkConnectors, egress) {
+				return false, fmt.Errorf("%w: microvm %q reports egress connectors %v, expected %v", ErrEgressMismatch, sb.id, g.EgressNetworkConnectors, egress)
+			}
 			if g.Endpoint != "" {
 				sb.endpoint = g.Endpoint
 			}
@@ -347,6 +380,11 @@ func (m *Manager) Launch(ctx context.Context, imageARN string, opts ...LaunchOpt
 			return false, nil
 		}
 	}); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), failedLaunchCleanupTimeout)
+		defer cancel()
+		if cleanupErr := m.Terminate(cleanupCtx, sb.id); cleanupErr != nil {
+			return nil, fmt.Errorf("%w; terminate unverified microvm: %v", err, cleanupErr)
+		}
 		return nil, err
 	}
 	return sb, nil

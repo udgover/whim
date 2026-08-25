@@ -59,21 +59,54 @@ func (m *Manager) ListImages(ctx context.Context) ([]ImageSummary, error) {
 	return summaries, nil
 }
 
-// egressConnectors returns the connector ARNs to embed in the image for the
-// requested egress mode. Egress is fixed at build time and inherited by runs.
-func egressConnectors(mode EgressMode, region string) ([]string, error) {
+func publicEgressConnectorARN(region string) string {
+	return fmt.Sprintf("arn:aws:lambda:%s:aws:network-connector:aws-network-connector:INTERNET_EGRESS", region)
+}
+
+// egressConnectors returns the connector ARNs for the requested egress mode.
+// Whim records these on the image and also passes them to run-microvm, where
+// AWS associates network connectors with the launched MicroVM.
+func egressConnectors(mode EgressMode, region, connectorARN string) ([]string, error) {
 	switch mode {
 	case EgressPublic:
-		return []string{
-			fmt.Sprintf("arn:aws:lambda:%s:aws:network-connector:aws-network-connector:INTERNET_EGRESS", region),
-		}, nil
+		if connectorARN != "" {
+			return nil, fmt.Errorf("%w: EgressPublic uses the managed INTERNET_EGRESS connector, not a custom connector", ErrInvalidOption)
+		}
+		return []string{publicEgressConnectorARN(region)}, nil
 	case EgressNone:
-		return nil, nil
+		if connectorARN == "" {
+			return nil, fmt.Errorf("%w: EgressNone requires an isolated VPC network connector ARN; AWS has no managed NO_EGRESS connector", ErrInvalidOption)
+		}
+		if isInternetEgressConnector(connectorARN) {
+			return nil, fmt.Errorf("%w: EgressNone cannot use the managed INTERNET_EGRESS connector", ErrInvalidOption)
+		}
+		return []string{connectorARN}, nil
 	case EgressVPC:
-		return nil, fmt.Errorf("%w: EgressVPC is not supported in v0.1", ErrInvalidOption)
+		if connectorARN == "" {
+			return nil, fmt.Errorf("%w: EgressVPC requires a VPC network connector ARN", ErrInvalidOption)
+		}
+		return []string{connectorARN}, nil
 	default:
 		return nil, fmt.Errorf("%w: unknown egress mode %d", ErrInvalidOption, mode)
 	}
+}
+
+func (m *Manager) imageEgressConnectors(ctx context.Context, arn string) ([]string, error) {
+	img, err := m.GetImage(ctx, arn)
+	if err != nil {
+		return nil, err
+	}
+	ver, err := m.api.GetMicrovmImageVersion(ctx, &awsapi.GetMicrovmImageVersionInput{
+		ImageIdentifier: arn,
+		ImageVersion:    img.ImageVersion,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(ver.EgressConnectors) == 0 {
+		return nil, fmt.Errorf("%w: image %q has no egress connector metadata; refusing AWS's public-default fallback", ErrEgressMismatch, arn)
+	}
+	return append([]string(nil), ver.EgressConnectors...), nil
 }
 
 // validateCapabilities rejects any capability whose value AWS does not accept.
@@ -106,7 +139,7 @@ func (m *Manager) validateImageSpec(spec ImageSpec) error {
 	if err := validateCapabilities(spec.Capabilities); err != nil {
 		return err
 	}
-	if _, err := egressConnectors(spec.Egress, m.region); err != nil {
+	if _, err := egressConnectors(spec.Egress, m.region, spec.EgressConnectorARN); err != nil {
 		return err
 	}
 	return nil
@@ -158,14 +191,33 @@ func (m *Manager) ImageCapabilities(ctx context.Context, arn string) ([]Capabili
 // checkReuseCapabilities enforces the capability contract before an existing
 // image is reused: its baked capabilities must match those requested, else
 // reuse would silently grant or drop privilege.
-func (m *Manager) checkReuseCapabilities(ctx context.Context, arn, name string, want []Capability) error {
-	have, err := m.ImageCapabilities(ctx, arn)
+func (m *Manager) checkReuseImage(ctx context.Context, arn, name string, wantSpec ImageSpec) error {
+	img, err := m.GetImage(ctx, arn)
 	if err != nil {
-		return fmt.Errorf("verify capabilities of existing image %q: %w", name, err)
+		return err
 	}
-	if !capabilitiesEqual(have, want) {
+	ver, err := m.api.GetMicrovmImageVersion(ctx, &awsapi.GetMicrovmImageVersionInput{
+		ImageIdentifier: arn,
+		ImageVersion:    img.ImageVersion,
+	})
+	if err != nil {
+		return fmt.Errorf("verify existing image %q: %w", name, err)
+	}
+	haveCaps := make([]Capability, len(ver.Capabilities))
+	for i, c := range ver.Capabilities {
+		haveCaps[i] = Capability(c)
+	}
+	if !capabilitiesEqual(haveCaps, wantSpec.Capabilities) {
 		return fmt.Errorf("%w: existing image %q has %v but %v was requested; rebuild with --force",
-			ErrCapabilityMismatch, name, have, want)
+			ErrCapabilityMismatch, name, haveCaps, wantSpec.Capabilities)
+	}
+	wantEgress, err := egressConnectors(wantSpec.Egress, m.region, wantSpec.EgressConnectorARN)
+	if err != nil {
+		return err
+	}
+	if len(ver.EgressConnectors) != len(wantEgress) || !sameStringSet(ver.EgressConnectors, wantEgress) {
+		return fmt.Errorf("%w: existing image %q has egress connectors %v but %v was requested; rebuild with --force",
+			ErrEgressMismatch, name, ver.EgressConnectors, wantEgress)
 	}
 	return nil
 }
@@ -191,7 +243,7 @@ func (m *Manager) BuildImage(ctx context.Context, spec ImageSpec) (*ImageBuild, 
 	if err := m.validateImageSpec(spec); err != nil {
 		return nil, err
 	}
-	connectors, err := egressConnectors(spec.Egress, m.region)
+	connectors, err := egressConnectors(spec.Egress, m.region, spec.EgressConnectorARN)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +298,7 @@ func (m *Manager) EnsureImage(ctx context.Context, spec ImageSpec) (string, erro
 	}
 	arn := m.imageARN(spec.Name)
 
-	resolved, found, err := m.reuseImage(ctx, arn, spec.Name, spec.Capabilities)
+	resolved, found, err := m.reuseImage(ctx, arn, spec)
 	if err != nil {
 		return "", err
 	}
@@ -267,7 +319,7 @@ func (m *Manager) EnsureImage(ctx context.Context, spec ImageSpec) (string, erro
 // error) only when the image is genuinely absent (ErrImageNotFound), signalling
 // the caller to build; any other lookup error is returned and never built over.
 // An existing image is never rebuilt here — that would conflict on its name.
-func (m *Manager) reuseImage(ctx context.Context, arn, name string, wantCaps []Capability) (string, bool, error) {
+func (m *Manager) reuseImage(ctx context.Context, arn string, wantSpec ImageSpec) (string, bool, error) {
 	build, err := m.GetImage(ctx, arn)
 	switch {
 	case err == nil:
@@ -279,13 +331,14 @@ func (m *Manager) reuseImage(ctx context.Context, arn, name string, wantCaps []C
 				return "", true, perr
 			}
 		case imageStateCreateFailed, imageStateUpdateFailed:
-			return "", true, fmt.Errorf("%w: image %q is in %s state", ErrImageBuildFailed, name, build.State)
+			return "", true, fmt.Errorf("%w: image %q is in %s state", ErrImageBuildFailed, wantSpec.Name, build.State)
 		default:
-			return "", true, fmt.Errorf("%w: image %q is in unexpected state %s", ErrImageBuildFailed, name, build.State)
+			return "", true, fmt.Errorf("%w: image %q is in unexpected state %s", ErrImageBuildFailed, wantSpec.Name, build.State)
 		}
-		// Capabilities are part of the reuse contract: never reuse an image whose
-		// privilege differs from what was requested.
-		if err := m.checkReuseCapabilities(ctx, arn, name, wantCaps); err != nil {
+		// Capabilities and egress connectors are part of the reuse contract:
+		// never reuse an image whose privileges or network isolation differ from
+		// what was requested.
+		if err := m.checkReuseImage(ctx, arn, wantSpec.Name, wantSpec); err != nil {
 			return "", true, err
 		}
 		return arn, true, nil

@@ -28,8 +28,12 @@ go.work.sum
 .env
 
 # Editor/IDE
+.DS_Store
 .idea/
 .vscode/
+
+# Local CLI build output
+/whim
 
 dev/
 build/
