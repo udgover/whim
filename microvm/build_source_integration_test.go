@@ -177,7 +177,7 @@ func TestIntegration_BuildFromLocalDirectory(t *testing.T) {
 	assert.Equal(t, "42", strings.TrimSpace(string(res.Output)), "built image must run commands")
 }
 
-func TestIntegration_BuildEgressNone(t *testing.T) {
+func TestIntegration_PublicBuildWithNoPublicRuntimeEgress(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	in := integrationBuildInputs(t, ctx)
@@ -188,10 +188,13 @@ func TestIntegration_BuildEgressNone(t *testing.T) {
 	}
 	validated, err := in.mgr.ValidateNoPublicEgressConnector(ctx, microvm.NoPublicEgressResources{ConnectorARN: connectorARN})
 	require.NoError(t, err, "the supplied connector must prove the no-public-egress contract")
-	// Covers --egress none: the image must build with the supplied isolated VPC
-	// connector and launch from its baked metadata while revalidating topology.
-	arn := buildAndCleanup(t, ctx, in, "whim-it-egress-none", localBuildContext(t), microvm.EgressNone, connectorARN)
-	sb, err := in.mgr.Launch(ctx, arn, microvm.WithTTL(5*time.Minute), microvm.WithExpectedNoPublicEgress(*validated))
+	// Image creation needs public egress; the isolated connector is an explicit,
+	// topology-validated runtime override.
+	arn := buildAndCleanup(t, ctx, in, "whim-it-egress-none", localBuildContext(t), microvm.EgressPublic, "")
+	sb, err := in.mgr.Launch(ctx, arn,
+		microvm.WithTTL(5*time.Minute),
+		microvm.WithEgressConnector(microvm.EgressNone, connectorARN),
+		microvm.WithExpectedNoPublicEgress(*validated))
 	require.NoError(t, err)
 	cleanupSandbox(t, in, sb)
 	t.Logf("egress-none image launched: id=%s", sb.ID())
@@ -232,9 +235,8 @@ func probeBuildContext(t *testing.T) string {
 
 // TestIntegration_NoPublicEgress provisions (or reuses) a Whim-managed
 // no-public-egress resource group via EnsureNoPublicEgressConnector, builds
-// an EgressNone image whose probe Dockerfile needs no build-time network,
-// launches from the image's baked connector without an egress override, and
-// revalidates the recorded topology before launch. It proves the MVP
+// the minimal probe image with public egress, then launches it with the exact
+// isolated connector as a validated runtime override. It proves the MVP
 // NO_PUBLIC_EGRESS security contract: MicroVM metadata never reports
 // INTERNET_EGRESS, and direct public IP / HTTPS hostname connections from
 // the guest fail. DNS behavior is recorded, not asserted — MVP does not
@@ -262,9 +264,10 @@ func TestIntegration_NoPublicEgress(t *testing.T) {
 	t.Logf("no-public-egress resource group: vpc=%s subnet=%v rt=%s sg=%s connector=%s",
 		resources.VPCID, resources.SubnetIDs, resources.RouteTableID, resources.SecurityGroupID, resources.ConnectorARN)
 
-	arn := buildAndCleanup(t, ctx, in, "whim-it-no-public-egress-probe", probeBuildContext(t), microvm.EgressNone, resources.ConnectorARN)
+	arn := buildAndCleanup(t, ctx, in, "whim-it-no-public-egress-probe", probeBuildContext(t), microvm.EgressPublic, "")
 
 	sb, err := in.mgr.Launch(ctx, arn, microvm.WithTTL(5*time.Minute),
+		microvm.WithEgressConnector(microvm.EgressNone, resources.ConnectorARN),
 		microvm.WithExpectedNoPublicEgress(*resources))
 	require.NoError(t, err)
 	cleanupSandbox(t, in, sb)
@@ -276,11 +279,8 @@ func TestIntegration_NoPublicEgress(t *testing.T) {
 		MicrovmIdentifier: aws.String(sb.ID()),
 	})
 	require.NoError(t, err)
-	for _, c := range meta.EgressNetworkConnectors {
-		assert.NotContains(t, c, "INTERNET_EGRESS",
-			"no-public-egress MicroVM metadata must never report the managed INTERNET_EGRESS connector")
-	}
-	assert.Contains(t, meta.EgressNetworkConnectors, resources.ConnectorARN)
+	assert.Equal(t, []string{resources.ConnectorARN}, meta.EgressNetworkConnectors,
+		"runtime metadata must report exactly the isolated connector and never INTERNET_EGRESS")
 
 	// DNS is recorded, not required to fail — MVP NO_PUBLIC_EGRESS allows it.
 	dnsRes, dnsErr := sb.Exec(ctx, []string{"sh", "-c", "getent hosts example.com"})

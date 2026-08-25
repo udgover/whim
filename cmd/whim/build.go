@@ -234,10 +234,9 @@ func validateEgressRequirement(cmd *cobra.Command, egress microvm.EgressMode) er
 	return nil
 }
 
-// resolveBuildEgressConnector resolves the connector ARN to use for the
-// build, and — only for the --egress-auto-provision path — the managed
-// resource group behind it, for persisting (Task 4.2) and --json (Task 4.3).
-// Every other path returns a nil resources pointer.
+// resolveBuildEgressConnector resolves the connector ARN to use at runtime and
+// the validated resource group behind it. The build command persists this
+// runtime policy after creating the image with public egress.
 func resolveBuildEgressConnector(ctx context.Context, cmd *cobra.Command, mgr *microvm.Manager, egress microvm.EgressMode) (string, *microvm.NoPublicEgressResources, error) {
 	if egress == microvm.EgressPublic {
 		if egressConnectorFlagsChanged(cmd) {

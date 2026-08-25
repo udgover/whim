@@ -57,8 +57,8 @@ different setup requirements — pick the least-powerful one that fits:
 
 If you already run an isolated VPC and connector, `--egress-connector` needs no
 create permissions, but Whim still needs Lambda Core and EC2 read access to
-prove the connector is safe before build and launch. The rest of this guide is
-mostly about the two modes that create resources.
+prove the connector is safe before recording and applying it at launch. The
+rest of this guide is mostly about the two modes that create resources.
 
 ## Setting up the operator role (least privilege)
 

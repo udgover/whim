@@ -102,9 +102,9 @@ the `microvm` library transports are local, `s3://`, and `https://` only.
 - **`--name` is required** and is the cache key: a second `whim build --name X`
   reuses the existing image `X` unless you pass `--force` (which deletes and
   rebuilds). Name-as-key means a changed source does **not** rebuild on its own.
-- **`--egress public|none`** records the image's intended egress connector set
-  and Whim mirrors it when launching VMs. AWS associates network connectors at
-  `run-microvm` time, and public internet egress is the service default.
+- **`--egress public|none`** records the image's intended runtime egress policy.
+  AWS associates network connectors at `run-microvm` time, and public internet
+  egress is the service default.
   `public` uses AWS's managed `INTERNET_EGRESS` connector. `none` means
   **`NO_PUBLIC_EGRESS`** — direct public IP and public-hostname HTTPS
   connections fail — **not** a native `NO_EGRESS` mode; AWS does not document
@@ -138,11 +138,13 @@ the `microvm` library transports are local, `s3://`, and `https://` only.
   **`--egress-strict-dns` is not implemented**: DNS resolution is not
   blocked under `--egress none` (see Security model).
 
-  **The image build itself egresses through whatever `--egress` resolves
-  to.** A Dockerfile with network-dependent `RUN` steps (package installs,
-  etc.) will fail to build under `--egress none` against an isolated
-  connector — build those images under `--egress public` first, then launch
-  them against the isolated connector at run time instead.
+  **Build-time and runtime egress are deliberately separate.** Image creation
+  always uses public egress so the service can pull the container base and run
+  network-dependent build steps. For `--egress none`, Whim then launches every
+  VM with the recorded isolated connector as an explicit override, after
+  revalidating its VPC topology. Runtime metadata must report exactly that
+  connector or Whim terminates the unverified VM. The rationale is recorded in
+  [ADR-001](docs/decisions/001-separate-build-and-runtime-egress.md).
 
   For the AWS requirements (operator role, caller permissions, service-linked
   role) and how to grant them following least privilege, see
@@ -288,8 +290,7 @@ arn, err := mgr.BuildFromSource(ctx, "./app", microvm.BuildFromSourceOptions{
     ArtifactBucket:     "my-artifact-bucket",  // caller-owned; staged context uploads here (required)
     BaseImageARN:       baseImageARN,          // managed/base image to build on (required)
     BuildRoleARN:       buildRoleARN,          // role the build assumes to read the staged artifact (required)
-    Egress:             microvm.EgressNone,    // connector-backed isolated VPC egress
-    EgressConnectorARN: isolatedConnectorARN, // required for EgressNone
+    Egress:             microvm.EgressPublic, // build-time access for the container base and RUN steps
     // Force, ContextSubdir, HTTPSHeaders, MaxCompressedBytes, MaxUncompressedBytes …
 })
 ```
@@ -298,9 +299,9 @@ arn, err := mgr.BuildFromSource(ctx, "./app", microvm.BuildFromSourceOptions{
 `https://host/path`; `http://`, credential-bearing URL userinfo, and unknown
 schemes are rejected.
 
-`isolatedConnectorARN` above can come from your own connector, or from
-`Manager.EnsureNoPublicEgressConnector` — the library call the CLI's
-`--egress-auto-provision` wraps. It discovers-and-validates a Whim-managed
+The isolated runtime connector can be your own connector, or come from
+`Manager.EnsureNoPublicEgressConnector`, which the CLI wraps for
+`--egress-auto-provision`. It discovers-and-validates a Whim-managed
 `NO_PUBLIC_EGRESS` VPC/subnet/route table/security group/connector, reusing
 it only after every layer passes validation, and creates one when nothing
 safe exists to reuse (never falling back to public egress on failure):
@@ -312,12 +313,16 @@ resources, err := mgr.EnsureNoPublicEgressConnector(ctx, microvm.NoPublicEgressS
     SubnetCIDRBlock: "10.242.99.0/25",
 })
 // resources.ConnectorARN, .VPCID, .SubnetIDs, .RouteTableID, .SecurityGroupID
+
+sb, err := mgr.Launch(ctx, arn,
+    microvm.WithEgressConnector(microvm.EgressNone, resources.ConnectorARN),
+    microvm.WithExpectedNoPublicEgress(*resources),
+)
 ```
 
 For a caller-managed connector, use `ValidateNoPublicEgressConnector` before
-building. At launch, pass the recorded result through
-`WithExpectedNoPublicEgress`; this verifies the baked image connector and
-revalidates the live topology without overriding image metadata.
+launch and pass its result through the same two launch options. The first sets
+the exact runtime connector; the second revalidates its recorded live topology.
 
 Errors are typed sentinels (match with `errors.Is`): `ErrInvalidOption`,
 `ErrInvalidSource`, `ErrSourceTooLarge`, `ErrImageNotFound`,
@@ -336,7 +341,7 @@ The VM runs **your code as root**, reachable only through an authenticated
 WebSocket. whim's guarantees:
 
 - **`--egress none` is `NO_PUBLIC_EGRESS`, live-tested, not just documented.**
-  A MicroVM launched from a `--egress none` image cannot reach a direct
+  A MicroVM launched with a recorded `--egress none` policy cannot reach a direct
   public IP or a public hostname over HTTPS: both time out at TCP connect,
   verified by the gated `TestIntegration_NoPublicEgress` flow against a real
   Whim-managed connector. **DNS resolution
@@ -456,10 +461,10 @@ WHIM_INTEGRATION=1 go test -tags=integration ./...
 ```
 
 The local-directory build runs as-is. Set `WHIM_TEST_EGRESS_CONNECTOR` to an
-isolated Lambda Core VPC connector ARN to run the `--egress none` integration
-test. Set `WHIM_TEST_EGRESS_OPERATOR_ROLE` to an IAM role ARN (trusting
-`lambda.amazonaws.com`, `AWSLambdaNetworkConnectorOperatorPolicy` attached) to
-run `TestIntegration_NoPublicEgress`, which provisions/reuses a real
+isolated Lambda Core VPC connector ARN to run the public-build/isolated-runtime
+integration test. Set `WHIM_TEST_EGRESS_OPERATOR_ROLE` to an IAM role ARN
+(trusting `lambda.amazonaws.com`, `AWSLambdaNetworkConnectorOperatorPolicy`
+attached) to run `TestIntegration_NoPublicEgress`, which provisions/reuses a real
 no-public-egress resource group via `EnsureNoPublicEgressConnector`, asserts
 MicroVM metadata never reports `INTERNET_EGRESS`, and asserts a direct public
 IP and an HTTPS public hostname both fail to connect. The same steps are in

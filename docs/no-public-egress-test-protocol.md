@@ -44,9 +44,8 @@ export OPERATOR_ROLE_ARN="arn:aws:iam::${ACCOUNT}:role/whim-test-operator-role"
 ```
 
 ```bash
-# 0.3  A build context whose Dockerfile needs NO build-time network.
-#      Amazon Linux 2023 already ships curl + getent, so no RUN step —
-#      this is what lets it build under --egress none (nothing egresses at build).
+# 0.3  A minimal probe image. Pulling its public container base needs public
+#      build-time egress; Amazon Linux 2023 already ships curl + getent.
 mkdir -p /tmp/eg-norun && cat > /tmp/eg-norun/Dockerfile <<'EOF'
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023
 CMD ["sleep", "infinity"]
@@ -89,7 +88,8 @@ run --egress none --egress-subnet subnet-a --egress-security-group sg-a   # ERR:
 ## Phase 2 — Auto-provision happy path `[mutates AWS]`
 
 ```bash
-# 2.1  Build → creates VPC/subnet/RT/SG/connector, records egress=none + connector.
+# 2.1  Image creation uses public egress. The command also creates the isolated
+#      runtime resources and records egress=none + connector for later launches.
 ./whim build /tmp/eg-norun --name whim-eg-auto \
   --egress none --egress-auto-provision \
   --egress-operator-role "$OPERATOR_ROLE_ARN" \
@@ -126,7 +126,8 @@ python3 -c "import json;print(json.load(open('$HOME/Library/Application Support/
 ```
 
 Launch and prove the guarantee (the AL2023 image has curl + getent, and
-`whim run` uses its recorded isolated connector):
+`whim run` explicitly overrides the public build connector with its recorded
+isolated runtime connector):
 
 ```bash
 # 2.7  Launch a persistent box from the recorded no-egress image
@@ -213,10 +214,11 @@ aws lambda-core get-network-connector --identifier "$CONNECTOR_ARN" --region "$R
 #   expect still ACTIVE — image rm never touches AWS networking
 ```
 
-## Phase 7 — Build-time network caveat (negative) `[mutates AWS]`
+## Phase 7 — Build-time public egress `[mutates AWS]`
 
 ```bash
-# 7.1  A Dockerfile that needs network at build time FAILS under --egress none.
+# 7.1  A Dockerfile that needs network at build time still builds successfully:
+#      --egress none is the runtime policy, while image creation remains public.
 mkdir -p /tmp/eg-netbuild && cat > /tmp/eg-netbuild/Dockerfile <<'EOF'
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023
 RUN dnf install -y jq && dnf clean all
@@ -224,7 +226,7 @@ CMD ["sleep", "infinity"]
 EOF
 ./whim build /tmp/eg-netbuild --name whim-eg-netbuild \
   --egress none --egress-connector "$CONNECTOR_ARN" --region "$REGION"
-#   expect: build fails (CREATE_FAILED) — the build egresses through the zero-route connector
+#   expect: image ready; future launches use $CONNECTOR_ARN at runtime
 ```
 
 ## Phase 8 — Cleanup `[mutates AWS]`
@@ -237,7 +239,7 @@ for i in $(seq 1 15); do
   case "$S" in TERMINATED|*NotFound*) break;; esac; sleep 5; done
 
 # 8.2  Delete images
-./whim image rm whim-eg-auto2 whim-eg-acme whim-eg-existing whim-eg-raw --region "$REGION" 2>/dev/null
+./whim image rm whim-eg-auto2 whim-eg-acme whim-eg-existing whim-eg-raw whim-eg-netbuild --region "$REGION" 2>/dev/null
 
 # 8.3  Delete connectors (poll each until gone).
 #      $CONNECTOR_ARN (auto), whim-raw-test (raw), and the acme connector.
@@ -274,12 +276,10 @@ aws ec2 describe-vpcs --region "$REGION" --filters Name=tag:ManagedBy,Values=whi
 
 ## Notes
 
-- **The single-image trick** (Phase 0.3): an Amazon Linux 2023 image with no
-  `RUN` step both triggers auto-provisioning *and* is probeable — AL2023 ships
-  `curl` and `getent`, so there is no build-time network need, so it builds
-  fine under `--egress none` and `whim run` launches it straight against the
-  isolated connector. Phase 7 re-introduces a network-needing `RUN` to confirm
-  the documented build-time failure mode.
+- **One minimal probe image is enough** (Phase 0.3): its public base is pulled
+  during the public build phase, and AL2023 already contains `curl` and
+  `getent`. `whim run` then applies the isolated connector at runtime. Phase 7
+  adds one network-dependent `RUN` only to prove the build/runtime split.
 - **Phases 3–5 leave extra resource groups/connectors.** Phase 8 removes the
   `whim-eg-auto` and `acme` groups and the `whim-raw-test` connector; the
   `whim-eg-existing` build reuses `$CONNECTOR_ARN` (no new resources).

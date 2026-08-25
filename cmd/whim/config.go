@@ -15,18 +15,17 @@ type Config struct {
 	// built ARN. It is additive: older configs with only image_arn load fine,
 	// and the default image continues to live in ImageARN.
 	Images map[string]string `json:"images,omitempty"`
-	// ImageEgress records the requested egress mode for custom images. It is
-	// separate from Images so older configs remain readable.
+	// ImageEgress records the requested runtime egress mode for custom images.
+	// It is separate from Images so older configs remain readable.
 	ImageEgress map[string]string `json:"image_egress,omitempty"`
-	// ImageEgressConnectors records the exact egress connector ARN used for
-	// custom images with connector-backed egress.
+	// ImageEgressConnectors records the exact runtime egress connector ARN used
+	// for custom images with connector-backed egress.
 	ImageEgressConnectors map[string]string `json:"image_egress_connectors,omitempty"`
 	// ImageEgressResourceGroups records the validated no-public-egress topology
-	// (VPC, subnet, route table, security group) used by a custom image. For
-	// --egress-auto-provision it also records the stable resource-group tag. This is
-	// informational, for future tooling such as an explicit cleanup command
-	// (see the source plan's Milestone 6): Whim never deletes the AWS
-	// resources it names based on this map, only the local cache entry.
+	// (VPC, subnet, route table, security group) revalidated before launch. For
+	// --egress-auto-provision it also records the stable resource-group tag for
+	// future cleanup tooling. Whim never deletes the named AWS resources based
+	// on this map, only the local cache entry.
 	ImageEgressResourceGroups map[string]EgressResourceGroup `json:"image_egress_resource_groups,omitempty"`
 }
 
@@ -63,13 +62,13 @@ func (c *Config) SetImage(name, arn string) {
 	c.Images[name] = arn
 }
 
-// Egress returns the cached egress mode for a custom image name.
+// Egress returns the cached runtime egress mode for a custom image name.
 func (c *Config) Egress(name string) (string, bool) {
 	egress, ok := c.ImageEgress[name]
 	return egress, ok
 }
 
-// SetEgress records the requested egress mode for a custom image name.
+// SetEgress records the requested runtime egress mode for a custom image name.
 func (c *Config) SetEgress(name, egress string) {
 	if c.ImageEgress == nil {
 		c.ImageEgress = make(map[string]string)
@@ -77,13 +76,13 @@ func (c *Config) SetEgress(name, egress string) {
 	c.ImageEgress[name] = egress
 }
 
-// EgressConnector returns the cached egress connector ARN for a custom image.
+// EgressConnector returns the cached runtime egress connector ARN for a custom image.
 func (c *Config) EgressConnector(name string) (string, bool) {
 	connector, ok := c.ImageEgressConnectors[name]
 	return connector, ok
 }
 
-// SetEgressConnector records the connector ARN used by a custom image.
+// SetEgressConnector records the connector ARN used to launch a custom image.
 func (c *Config) SetEgressConnector(name, connectorARN string) {
 	if connectorARN == "" {
 		if c.ImageEgressConnectors != nil {
@@ -105,7 +104,7 @@ func (c *Config) EgressResourceGroup(name string) (EgressResourceGroup, bool) {
 }
 
 // SetEgressResourceGroup records the validated no-public-egress topology used
-// by a custom image. Passing the zero value clears any
+// to launch a custom image. Passing the zero value clears any
 // existing entry, matching SetEgressConnector's empty-string-clears
 // convention. ConnectorARN is required for every managed or caller-supplied
 // topology, so its absence is the clear signal.
